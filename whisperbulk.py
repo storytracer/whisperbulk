@@ -694,12 +694,94 @@ async def collect_files(input_path: str, recursive: bool) -> List[Union[str, Pat
     storage = get_storage_manager(input_path)
     
     try:
-        # List files with the storage manager
-        files: List[Union[str, Path]] = await storage.list_files(input_path, recursive)
-        
-        if not files and isinstance(storage, LocalStorageManager):
-            path = Path(input_path)
-            if path.is_dir():
+        # For S3 storage, we need to use pagination which naturally gives us incremental updates
+        if isinstance(storage, S3StorageManager):
+            files = []
+            parsed = urlparse(input_path)
+            bucket = parsed.netloc
+            prefix = parsed.path.lstrip('/')
+            
+            if not recursive and prefix and not prefix.endswith('/'):
+                # If not recursive, we only want objects in this "directory"
+                prefix = f"{prefix}/"
+            
+            print(f"Searching for audio files in s3://{bucket}/{prefix}...")
+            
+            # Create progress bar without a total (unknown at start)
+            progress = tqdm(
+                desc="Discovering audio files",
+                unit="files",
+                leave=True
+            )
+            
+            async with storage._get_client() as client:
+                paginator = client.get_paginator('list_objects_v2')
+                
+                async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                    if 'Contents' in page:
+                        # Filter results based on audio extensions
+                        for obj in page['Contents']:
+                            key = obj['Key']
+                            
+                            # Skip "directory" objects
+                            if key.endswith('/'):
+                                continue
+                            
+                            # Filter by audio extensions
+                            if any(key.lower().endswith(ext) for ext in AUDIO_EXTENSIONS):
+                                files.append(f"s3://{bucket}/{key}")
+                                progress.update(1)
+            
+            # Close the progress bar
+            progress.close()
+            
+            if not files:
+                print("No audio files found.")
+                
+        else:  # LocalStorageManager
+            path_obj = Path(str(input_path))
+            
+            # If it's a single file, just check if it's audio and return
+            if path_obj.is_file():
+                if is_audio_file(str(path_obj)):
+                    return [str(path_obj)]
+                else:
+                    return []
+            
+            print(f"Searching for audio files in {input_path}...")
+            files = []
+            
+            # Create a list of patterns for audio files
+            patterns = [f"*{ext}" for ext in AUDIO_EXTENSIONS]
+            
+            # Create progress bar without a total (unknown at start)
+            progress = tqdm(
+                desc="Discovering audio files",
+                unit="files",
+                leave=True
+            )
+            
+            # Process directory
+            if recursive:
+                for pattern in patterns:
+                    # Use ** for recursive search with pathlib
+                    glob_pattern = f"**/{pattern}"
+                    for file_path in path_obj.glob(glob_pattern):
+                        if file_path.is_file():  # Ensure it's a file
+                            files.append(str(file_path))
+                            progress.update(1)
+            else:
+                for pattern in patterns:
+                    for file_path in path_obj.glob(pattern):
+                        if file_path.is_file():  # Ensure it's a file
+                            files.append(str(file_path))
+                            progress.update(1)
+            
+            # Close the progress bar
+            progress.close()
+            
+            if not files and path_obj.is_dir():
+                print("No audio files found.")
                 logger.warning(
                     f"{input_path} is a directory with no audio files. "
                     f"Use --recursive to process subdirectories if needed."
@@ -710,6 +792,7 @@ async def collect_files(input_path: str, recursive: bool) -> List[Union[str, Pat
         
     except Exception as e:
         logger.error(f"Error collecting files from {input_path}: {e}")
+        print(f"Error searching for files: {e}")
         sys.exit(1)
 
 
