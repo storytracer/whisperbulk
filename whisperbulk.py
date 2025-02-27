@@ -359,7 +359,8 @@ async def process_file(
     file_path: Union[str, Path],
     output_dir: Union[str, Path, None] = None,
     model: str = "whisper-1",
-    formats: List[Literal["json", "txt", "srt"]] = ["json"]
+    formats: List[Literal["json", "txt", "srt"]] = ["json"],
+    input: str = ""  # Add input parameter to track original input path
 ) -> None:
     """Process a single file and save the transcription in all requested formats."""
     try:
@@ -367,6 +368,28 @@ async def process_file(
         
         # Function to get the path for a specific format
         def get_output_path(fmt: str) -> str:
+            # Get relative path for preserving directory structure
+            def get_relative_path():
+                if isinstance(file_path, str) and is_s3_path(file_path):
+                    parsed = urlparse(file_path)
+                    key = parsed.path.lstrip('/')
+                    input_path_obj = Path(key)
+                    # Get parent directories to preserve structure
+                    return input_path_obj.parent
+                else:
+                    # For local paths, get input directory
+                    input_base = Path(input)
+                    if input_base.is_file():
+                        input_base = input_base.parent
+                    # Get relative path from input base to file
+                    try:
+                        # Only compute relative path if file_path is within input directory
+                        rel_path = Path(file_path).resolve().relative_to(input_base.resolve())
+                        return rel_path.parent
+                    except ValueError:
+                        # If file isn't within input directory, just use filename
+                        return Path('.')
+            
             if output_dir:
                 if isinstance(output_dir, str) and is_s3_path(output_dir):
                     # Handle S3 output path
@@ -375,10 +398,24 @@ async def process_file(
                     prefix = parsed.path.lstrip('/')
                     if not prefix.endswith('/'):
                         prefix += '/'
+                    
+                    # Preserve directory structure relative to input path
+                    rel_path = get_relative_path()
+                    if rel_path != Path('.'):
+                        prefix += f"{rel_path}/"
+                        
                     return f"s3://{bucket}/{prefix}{file_path_obj.stem}.{fmt}"
                 else:
                     # Handle local output path
-                    return str(Path(output_dir) / f"{file_path_obj.stem}.{fmt}")
+                    rel_path = get_relative_path()
+                    output_path = Path(output_dir)
+                    if rel_path != Path('.'):
+                        output_path = output_path / rel_path
+                        
+                    # Ensure the directory exists
+                    output_path.mkdir(parents=True, exist_ok=True)
+                    
+                    return str(output_path / f"{file_path_obj.stem}.{fmt}")
             else:
                 # Store alongside input file
                 if isinstance(file_path, str) and is_s3_path(file_path):
@@ -451,7 +488,8 @@ async def process_file(
 async def should_process_file(
     file_path: Union[str, Path],
     output_dir: Optional[str],
-    formats: List[Literal["json", "txt", "srt"]]
+    formats: List[Literal["json", "txt", "srt"]],
+    input: str = ""  # Add input parameter to track original input path
 ) -> bool:
     """Check if a file needs to be processed by verifying if output files exist."""
     file_path_obj = Path(str(file_path))
@@ -464,6 +502,28 @@ async def should_process_file(
     
     # Function to get the path for a specific format
     def get_output_path(fmt: str) -> str:
+        # Get relative path for preserving directory structure
+        def get_relative_path():
+            if isinstance(file_path, str) and is_s3_path(file_path):
+                parsed = urlparse(file_path)
+                key = parsed.path.lstrip('/')
+                input_path_obj = Path(key)
+                # Get parent directories to preserve structure
+                return input_path_obj.parent
+            else:
+                # For local paths, get input directory
+                input_base = Path(input)
+                if input_base.is_file():
+                    input_base = input_base.parent
+                # Get relative path from input base to file
+                try:
+                    # Only compute relative path if file_path is within input directory
+                    rel_path = Path(file_path).resolve().relative_to(input_base.resolve())
+                    return rel_path.parent
+                except ValueError:
+                    # If file isn't within input directory, just use filename
+                    return Path('.')
+        
         if output_dir:
             if isinstance(output_dir, str) and is_s3_path(output_dir):
                 # Handle S3 output path
@@ -472,10 +532,24 @@ async def should_process_file(
                 prefix = parsed.path.lstrip('/')
                 if not prefix.endswith('/'):
                     prefix += '/'
+                
+                # Preserve directory structure relative to input path
+                rel_path = get_relative_path()
+                if rel_path != Path('.'):
+                    prefix += f"{rel_path}/"
+                    
                 return f"s3://{bucket}/{prefix}{file_stem}.{fmt}"
             else:
                 # Handle local output path
-                return str(Path(output_dir) / f"{file_stem}.{fmt}")
+                rel_path = get_relative_path()
+                output_path = Path(output_dir)
+                if rel_path != Path('.'):
+                    output_path = output_path / rel_path
+                    
+                # Ensure the directory exists
+                output_path.mkdir(parents=True, exist_ok=True)
+                
+                return str(output_path / f"{file_stem}.{fmt}")
         else:
             # Store alongside input file
             if isinstance(file_path, str) and is_s3_path(file_path):
@@ -532,7 +606,8 @@ async def process_files(
     concurrency: int = 5,
     model: str = "whisper-1",
     formats: List[Literal["json", "txt", "srt"]] = ["json"],
-    force: bool = False
+    force: bool = False,
+    input: str = ""  # Add input parameter to track original input path
 ) -> None:
     """Process multiple files concurrently, skipping files that already have outputs unless force=True."""
     # Ensure json is always in the formats list
@@ -547,7 +622,7 @@ async def process_files(
         # Check each file to see if it needs processing
         needs_processing_tasks = []
         for file_path in files:
-            needs_processing_tasks.append(should_process_file(file_path, output_dir, formats))
+            needs_processing_tasks.append(should_process_file(file_path, output_dir, formats, input))
         
         # Wait for all checks to complete
         needs_processing_results = await asyncio.gather(*needs_processing_tasks)
@@ -569,7 +644,7 @@ async def process_files(
 
     async def _process_with_semaphore(file_path):
         async with semaphore:
-            return await process_file(file_path, output_dir, model, formats)
+            return await process_file(file_path, output_dir, model, formats, input)
 
     # Set up progress bar
     progress = tqdm(
@@ -777,7 +852,7 @@ def main(input, output, concurrency, recursive, verbose, log_file, model, format
             logger.info("Running in resumable mode - will skip files that already have outputs")
             
         # Process the files
-        await process_files(files_to_process, output, concurrency, model, formats_list, force)
+        await process_files(files_to_process, output, concurrency, model, formats_list, force, input)
         
         logger.info(f"All files processed successfully in format(s): {', '.join(formats_list)}")
     
