@@ -35,6 +35,8 @@ logger = logging.getLogger("whisperbulk")
 
 # Configure OpenAI client
 client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# Configure Async OpenAI client
+async_client = openai.AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 
 @tenacity.retry(
@@ -46,18 +48,28 @@ client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
         f"{retry_state.outcome.exception() if retry_state.outcome else 'Unknown error'}"
     ),
 )
-def transcribe_file(file_path: Union[str, Path], model: str) -> Any:
+async def transcribe_file(file_path: Union[str, Path], model: str) -> Any:
     """Transcribe a single audio file using the specified Whisper model with retry logic."""
     logger.info(f"Transcribing {file_path} with model {model}")
 
-    with open(str(file_path), "rb") as audio_file:
-        response = client.audio.transcriptions.create(
-            file=audio_file,
-            model=model,
-            response_format="verbose_json"
-        )
-
+    # Use the async OpenAI client directly
+    # File reading still needs to be done in a thread pool since it's blocking I/O
+    loop = asyncio.get_running_loop()
+    file_content = await loop.run_in_executor(None, lambda: _read_file(file_path))
+    
+    # Now call the API using the async client
+    response = await async_client.audio.transcriptions.create(
+        file=file_content,
+        model=model,
+        response_format="verbose_json"
+    )
+    
     return response
+
+def _read_file(file_path: Union[str, Path]) -> Any:
+    """Read file from disk - helper function for thread pool executor."""
+    # Make sure we return a file object that OpenAI's API can accept
+    return open(str(file_path), "rb")
 
 
 def format_timestamp(seconds: float) -> str:
@@ -131,7 +143,8 @@ async def process_file(
 ) -> None:
     """Process a single file and save the transcription in all requested formats."""
     try:
-        result = transcribe_file(file_path, model)
+        # Use await with the async transcribe_file function
+        result = await transcribe_file(file_path, model)
         file_path_obj = Path(file_path)
         
         # Save the result in each requested format
@@ -142,7 +155,12 @@ async def process_file(
             else:
                 output_path = file_path_obj.with_suffix(f".{format}")
 
-            save_transcription(result, output_path, format)
+            # Create a bound function for the save operation
+            save_task = lambda: save_transcription(result, output_path, format)
+            
+            # Run the file saving in a thread pool to avoid blocking
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, save_task)
 
     except Exception as e:
         logger.error(f"Error processing {file_path}: {e}")
@@ -157,14 +175,16 @@ async def process_files(
     formats: List[Literal["json", "txt", "srt"]] = ["txt"]
 ) -> None:
     """Process multiple files concurrently."""
+    # Use a semaphore to limit concurrent API calls
     semaphore = asyncio.Semaphore(concurrency)
 
     async def _process_with_semaphore(file_path):
         async with semaphore:
             return await process_file(file_path, output_dir, model, formats)
 
+    # Set up progress bar
     progress = tqdm(
-        total=len(files), 
+        total=len(files),
         desc="Transcribing files",
         position=0,
         leave=True
@@ -173,9 +193,15 @@ async def process_files(
     async def process_and_update(file_path):
         try:
             await _process_with_semaphore(file_path)
+        except Exception as e:
+            logger.error(f"Failed to process {file_path}: {e}")
+            # We're already using return_exceptions=True in gather, but we still 
+            # need to handle exceptions here to ensure progress bar updates
         finally:
+            # Always update progress, even if file processing fails
             progress.update(1)
     
+    # Create tasks for all files and process them concurrently
     tasks = [process_and_update(file_path) for file_path in files]
     await asyncio.gather(*tasks, return_exceptions=True)
     progress.close()
