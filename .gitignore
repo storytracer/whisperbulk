@@ -173,4 +173,7 @@ cython_debug/
 # Data directory
 data/
 
+# Logs directory
+logs/
+
 .DS_Store

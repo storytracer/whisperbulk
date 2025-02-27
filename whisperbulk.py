@@ -27,9 +27,15 @@ AUDIO_EXTENSIONS = (".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm")
 dotenv.load_dotenv()
 
 # Setup logging
+log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "whisperbulk.log")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    filename=log_file,
+    filemode='a'
 )
 logger = logging.getLogger("whisperbulk")
 
@@ -311,7 +317,11 @@ def check_aws_credentials(uses_s3: bool) -> None:
 )
 @click.option(
     "--verbose", "-v", is_flag=True,
-    help="Enable verbose logging"
+    help="Enable verbose logging to the log file"
+)
+@click.option(
+    "--log-file", type=str, default=None,
+    help="Path to log file (default: logs/whisperbulk.log)"
 )
 @click.option(
     "--model", "-m", default="Systran/faster-whisper-small",
@@ -321,7 +331,7 @@ def check_aws_credentials(uses_s3: bool) -> None:
     "--format", "-f", default=["txt"], multiple=True, type=click.Choice(["json", "txt", "srt"]),
     help="Output format(s) for transcriptions (can be used multiple times)"
 )
-def main(input, output, concurrency, recursive, verbose, model, format):
+def main(input, output, concurrency, recursive, verbose, log_file, model, format):
     """Bulk transcribe audio files using Whisper models.
 
     INPUT is the source directory or file (or s3:// URI).
@@ -338,8 +348,25 @@ def main(input, output, concurrency, recursive, verbose, model, format):
     
         whisperbulk ./audio_files ./transcriptions -f txt -f srt -f json
     """
-    # Set log level
-    if verbose:
+    # Configure logging
+    if log_file:
+        # If user provided custom log file path
+        custom_log_dir = os.path.dirname(log_file)
+        if custom_log_dir:
+            os.makedirs(custom_log_dir, exist_ok=True)
+        
+        # Reconfigure the logging to use the custom file
+        for handler in logging.root.handlers[:]:
+            logging.root.removeHandler(handler)
+            
+        logging.basicConfig(
+            level=logging.DEBUG if verbose else logging.INFO,
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            filename=log_file,
+            filemode='a'
+        )
+    elif verbose:
+        # Just change the log level if using default log file
         logger.setLevel(logging.DEBUG)
 
     # Validate inputs and environment
