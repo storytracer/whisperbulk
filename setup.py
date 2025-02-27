@@ -16,6 +16,7 @@ setup(
         "tqdm",
         "aiofiles",
         "aiobotocore",
+        "srt",  # For SRT subtitle file generation
     ],
     extras_require={
         "dev": [
