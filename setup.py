@@ -10,14 +10,21 @@ setup(
     py_modules=["whisperbulk"],
     install_requires=[
         "click",
-        "openai",
+        "openai>=1.1.0",  # Ensure we use the version with the latest async API support
         "tenacity",
         "python-dotenv",
         "tqdm",
         "aiofiles",
-        "aiohttp",
         "aiobotocore",
     ],
+    extras_require={
+        "dev": [
+            "flake8",
+            "mypy",
+            "types-aiofiles",
+            "types-tqdm",
+        ],
+    },
     entry_points={
         "console_scripts": [
             "whisperbulk=whisperbulk:main",

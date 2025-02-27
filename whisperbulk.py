@@ -8,17 +8,17 @@ import sys
 import asyncio
 import logging
 import json
+import tempfile
 import aiofiles
-import aiohttp
 from pathlib import Path
-from typing import List, Optional, Union, Any, Dict, Literal, BinaryIO, Protocol, IO
+from typing import List, Optional, Union, Any, Dict, Literal, BinaryIO
 from urllib.parse import urlparse
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 
 import click
 import dotenv
-import openai
+from openai import AsyncOpenAI
 import tenacity
 from tqdm import tqdm
 
@@ -29,9 +29,9 @@ AUDIO_EXTENSIONS = (".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm")
 dotenv.load_dotenv()
 
 # Setup logging
-log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, "whisperbulk.log")
+log_dir = Path(__file__).parent / "logs"
+log_dir.mkdir(exist_ok=True)
+log_file = log_dir / "whisperbulk.log"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,10 +41,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("whisperbulk")
 
-# Configure OpenAI client
-client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-# Configure Async OpenAI client
-async_client = openai.AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 
 class StorageManager(ABC):
@@ -235,34 +232,7 @@ def get_storage_manager(path: Union[str, Path]) -> StorageManager:
         return LocalStorageManager()
 
 
-class AsyncFileObject:
-    """A file-like object that can be used with OpenAI's API."""
-    
-    def __init__(self, data: bytes, filename: str):
-        self.data = data
-        self.filename = filename
-        self.position = 0
-    
-    def read(self, size: int = -1) -> bytes:
-        """Read bytes from the file."""
-        if size == -1:
-            result = self.data[self.position:]
-            self.position = len(self.data)
-            return result
-        else:
-            result = self.data[self.position:self.position + size]
-            self.position += len(result)
-            return result
-    
-    def close(self) -> None:
-        """Close the file."""
-        pass
-    
-    # Make this compatible with OpenAI's API expectations
-    @property
-    def name(self) -> str:
-        """Return the filename."""
-        return self.filename
+# We don't need a custom file-like class anymore as we'll use temporary files
 
 
 @tenacity.retry(
@@ -278,23 +248,40 @@ async def transcribe_file(file_path: Union[str, Path], model: str) -> Any:
     """Transcribe a single audio file using the specified Whisper model with retry logic."""
     logger.info(f"Transcribing {file_path} with model {model}")
     
-    # Use the appropriate storage manager to read the file
-    storage = get_storage_manager(file_path)
-    
-    # Read the file data
-    file_data = await storage.read_binary(file_path)
-    
-    # Create a file-like object from the binary data
-    file_obj = AsyncFileObject(file_data, os.path.basename(str(file_path)))
-    
-    # Call the API using the async client
-    response = await async_client.audio.transcriptions.create(
-        file=file_obj,
-        model=model,
-        response_format="verbose_json"
-    )
-    
-    return response
+    # For S3 files or other remote files, we need to download them first
+    if isinstance(file_path, str) and is_s3_path(file_path):
+        # Use the storage manager to read the file
+        storage = get_storage_manager(file_path)
+        file_data = await storage.read_binary(file_path)
+        
+        # Create a temporary file
+        file_name = Path(str(file_path)).name
+        with tempfile.NamedTemporaryFile(suffix=file_name, delete=False) as temp_file:
+            temp_file.write(file_data)
+            temp_file_path = Path(temp_file.name)
+        
+        try:
+            # Use the local file path for transcription
+            with open(temp_file_path, "rb") as file_obj:
+                response = await openai_client.audio.transcriptions.create(
+                    file=file_obj, 
+                    model=model,
+                    response_format="verbose_json"
+                )
+            return response
+        finally:
+            # Clean up the temporary file
+            if temp_file_path.exists():
+                temp_file_path.unlink()
+    else:
+        # For local files, we can use them directly
+        with open(str(file_path), "rb") as file_obj:
+            response = await openai_client.audio.transcriptions.create(
+                file=file_obj,
+                model=model,
+                response_format="verbose_json"
+            )
+        return response
 
 
 def format_timestamp(seconds: float) -> str:
@@ -392,7 +379,7 @@ async def process_file(
                     output_path = f"s3://{bucket}/{prefix}{file_path_obj.stem}.{format}"
                 else:
                     # Handle local output path
-                    output_path = Path(output_dir) / f"{file_path_obj.stem}.{format}"
+                    output_path = str(Path(output_dir) / f"{file_path_obj.stem}.{format}")
             else:
                 # Store alongside input file
                 if isinstance(file_path, str) and is_s3_path(file_path):
@@ -400,13 +387,16 @@ async def process_file(
                     parsed = urlparse(file_path)
                     bucket = parsed.netloc
                     key = parsed.path.lstrip('/')
-                    dir_part = os.path.dirname(key)
-                    stem = os.path.basename(file_path_obj.stem)
+                    
+                    # Use pathlib to handle the path components
+                    key_path = Path(key)
+                    dir_part = str(key_path.parent) if key_path.parent != Path('.') else ""
+                    stem = file_path_obj.stem
                     new_key = f"{dir_part}/{stem}.{format}" if dir_part else f"{stem}.{format}"
                     output_path = f"s3://{bucket}/{new_key}"
                 else:
                     # For local input, use same directory
-                    output_path = file_path_obj.with_suffix(f".{format}")
+                    output_path = str(file_path_obj.with_suffix(f".{format}"))
 
             # Add the save task to our list
             save_tasks.append(save_transcription(result, output_path, format))
@@ -447,7 +437,7 @@ async def should_process_file(
         else:
             # Handle local output paths
             for format in formats:
-                output_path = Path(output_dir) / f"{file_stem}.{format}"
+                output_path = str(Path(output_dir) / f"{file_stem}.{format}")
                 output_paths.append(output_path)
     else:
         # Store alongside input file
@@ -456,8 +446,11 @@ async def should_process_file(
             parsed = urlparse(file_path)
             bucket = parsed.netloc
             key = parsed.path.lstrip('/')
-            dir_part = os.path.dirname(key)
-            stem = os.path.basename(file_stem)
+            
+            # Use pathlib to handle the path components
+            key_path = Path(key)
+            dir_part = str(key_path.parent) if key_path.parent != Path('.') else ""
+            stem = Path(file_stem).name
             
             # Generate S3 output paths for each format
             for format in formats:
@@ -467,7 +460,7 @@ async def should_process_file(
         else:
             # For local input, use same directory
             for format in formats:
-                output_path = file_path_obj.with_suffix(f".{format}")
+                output_path = str(file_path_obj.with_suffix(f".{format}"))
                 output_paths.append(output_path)
     
     # Check if all expected output files exist
@@ -561,7 +554,7 @@ def is_s3_path(path: str) -> bool:
 def ensure_output_dir(output_dir: Optional[str]) -> None:
     """Ensure the output directory exists if it's a local path."""
     if output_dir and not is_s3_path(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
 
 
 async def collect_files(input_path: str, recursive: bool) -> List[str]:
@@ -664,9 +657,9 @@ def main(input, output, concurrency, recursive, verbose, log_file, model, format
     # Configure logging
     if log_file:
         # If user provided custom log file path
-        custom_log_dir = os.path.dirname(log_file)
-        if custom_log_dir:
-            os.makedirs(custom_log_dir, exist_ok=True)
+        log_path = Path(log_file)
+        if log_path.parent != Path('.'):
+            log_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Reconfigure the logging to use the custom file
         for handler in logging.root.handlers[:]:
@@ -675,7 +668,7 @@ def main(input, output, concurrency, recursive, verbose, log_file, model, format
         logging.basicConfig(
             level=logging.DEBUG if verbose else logging.INFO,
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            filename=log_file,
+            filename=log_path,
             filemode='a'
         )
     elif verbose:
@@ -691,7 +684,7 @@ def main(input, output, concurrency, recursive, verbose, log_file, model, format
 
     # Ensure local output directory exists
     if output and not is_s3_path(output):
-        os.makedirs(output, exist_ok=True)
+        Path(output).mkdir(parents=True, exist_ok=True)
 
     # Use asyncio to run the entire pipeline
     async def run_pipeline():
