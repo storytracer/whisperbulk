@@ -163,16 +163,22 @@ async def process_files(
         async with semaphore:
             return await process_file(file_path, output_dir, model, formats)
 
-    with tqdm(total=len(files), desc="Transcribing files") as progress:
-        tasks = [
-            asyncio.create_task(_process_with_semaphore(file_path))
-            for file_path in files
-        ]
-
-        for task in tasks:
-            task.add_done_callback(lambda _: progress.update(1))
-
-        await asyncio.gather(*tasks, return_exceptions=True)
+    progress = tqdm(
+        total=len(files), 
+        desc="Transcribing files",
+        position=0,
+        leave=True
+    )
+    
+    async def process_and_update(file_path):
+        try:
+            await _process_with_semaphore(file_path)
+        finally:
+            progress.update(1)
+    
+    tasks = [process_and_update(file_path) for file_path in files]
+    await asyncio.gather(*tasks, return_exceptions=True)
+    progress.close()
 
 
 def is_audio_file(filename: str) -> bool:
