@@ -12,10 +12,11 @@ setup(
         "click",
         "openai",
         "tenacity",
-        "smart_open",
         "python-dotenv",
         "tqdm",
-        "boto3",
+        "aiofiles",
+        "aiohttp",
+        "aiobotocore",
     ],
     entry_points={
         "console_scripts": [
