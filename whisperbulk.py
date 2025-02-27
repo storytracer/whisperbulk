@@ -600,8 +600,154 @@ async def should_process_file(
     
     return need_processing
 
+async def get_existing_output_files(output_dir: Optional[str], formats: List[Literal["json", "txt", "srt"]]) -> Dict[str, bool]:
+    """Efficiently retrieve all existing output files to avoid individual file checks."""
+    existing_files: Dict[str, bool] = {}
+    
+    if not output_dir:
+        # If no output directory is specified, we can't pre-cache the files
+        # This typically means outputs are alongside inputs, which makes bulk checking difficult
+        return existing_files
+    
+    logger.info(f"Pre-caching existing output files in {output_dir}")
+    progress = tqdm(desc="Scanning existing output files", unit="files", leave=True)
+    
+    storage = get_storage_manager(output_dir)
+    
+    # Collect files for all formats we're interested in
+    for fmt in formats:
+        pattern = f"*.{fmt}"
+        try:
+            files = await storage.list_files(output_dir, recursive=True, pattern=pattern)
+            for file_path in files:
+                existing_files[file_path] = True
+                progress.update(1)
+        except Exception as e:
+            logger.warning(f"Error listing existing {fmt} files in {output_dir}: {e}")
+    
+    progress.close()
+    logger.info(f"Found {len(existing_files)} existing output files in {output_dir}")
+    return existing_files
+
+async def should_process_file_with_cache(
+    file_path: Union[str, Path],
+    output_dir: Optional[str],
+    formats: List[Literal["json", "txt", "srt"]],
+    existing_files_cache: Dict[str, bool],
+    input: str = ""
+) -> bool:
+    """Check if a file needs to be processed using the pre-cached file list."""
+    file_path_obj = Path(str(file_path))
+    file_stem = file_path_obj.stem
+    
+    # Ensure json is always in the formats list for checking
+    formats_to_check = formats.copy()
+    if "json" not in formats_to_check:
+        formats_to_check.insert(0, "json")  # Add json as the first format
+    
+    # Function to get the path for a specific format
+    def get_output_path(fmt: str) -> str:
+        # Get relative path for preserving directory structure
+        def get_relative_path():
+            if isinstance(file_path, str) and is_s3_path(file_path):
+                parsed = urlparse(file_path)
+                key = parsed.path.lstrip('/')
+                input_path_obj = Path(key)
+                # Get parent directories to preserve structure
+                return input_path_obj.parent
+            else:
+                # For local paths, get input directory
+                input_base = Path(input)
+                if input_base.is_file():
+                    input_base = input_base.parent
+                # Get relative path from input base to file
+                try:
+                    # Only compute relative path if file_path is within input directory
+                    rel_path = Path(file_path).resolve().relative_to(input_base.resolve())
+                    return rel_path.parent
+                except ValueError:
+                    # If file isn't within input directory, just use filename
+                    return Path('.')
+        
+        if output_dir:
+            if isinstance(output_dir, str) and is_s3_path(output_dir):
+                # Handle S3 output path
+                parsed = urlparse(output_dir)
+                bucket = parsed.netloc
+                prefix = parsed.path.lstrip('/')
+                if not prefix.endswith('/'):
+                    prefix += '/'
+                
+                # Preserve directory structure relative to input path
+                rel_path = get_relative_path()
+                if rel_path != Path('.'):
+                    prefix += f"{rel_path}/"
+                    
+                return f"s3://{bucket}/{prefix}{file_stem}.{fmt}"
+            else:
+                # Handle local output path
+                rel_path = get_relative_path()
+                output_path = Path(output_dir)
+                if rel_path != Path('.'):
+                    output_path = output_path / rel_path
+                    
+                # Ensure the directory exists
+                output_path.mkdir(parents=True, exist_ok=True)
+                
+                return str(output_path / f"{file_stem}.{fmt}")
+        else:
+            # Store alongside input file
+            if isinstance(file_path, str) and is_s3_path(file_path):
+                # For S3 input, keep in same bucket/prefix
+                parsed = urlparse(file_path)
+                bucket = parsed.netloc
+                key = parsed.path.lstrip('/')
+                
+                # Use pathlib to handle the path components
+                key_path = Path(key)
+                dir_part = str(key_path.parent) if key_path.parent != Path('.') else ""
+                stem = Path(file_stem).name
+                
+                new_key = f"{dir_part}/{stem}.{fmt}" if dir_part else f"{stem}.{fmt}"
+                return f"s3://{bucket}/{new_key}"
+            else:
+                # For local input, use same directory
+                return str(file_path_obj.with_suffix(f".{fmt}"))
+    
+    # Check if output directory is provided, use the cache for efficient checking
+    if output_dir and existing_files_cache:
+        # First check JSON format
+        json_path = get_output_path("json")
+        json_exists = json_path in existing_files_cache
+        
+        # If JSON doesn't exist, we need to process
+        if not json_exists:
+            return True
+        
+        # If only JSON was requested and it exists, skip
+        if len(formats) == 1 and formats[0] == "json":
+            logger.debug(f"Skipping {file_path} as JSON output already exists")
+            return False
+            
+        # Check other requested formats
+        need_processing = False
+        for fmt in formats:
+            if fmt != "json":  # Skip JSON as we already checked it
+                output_path = get_output_path(fmt)
+                if output_path not in existing_files_cache:
+                    need_processing = True
+                    break
+                    
+        if not need_processing:
+            logger.debug(f"Skipping {file_path} as all output files already exist")
+            
+        return need_processing
+    else:
+        # Fall back to individual file checking if no cache or no output directory
+        return await should_process_file(file_path, output_dir, formats, input)
+
 async def process_files(
-    files: List[Union[str, Path]],
+    files: List[str],
     output_dir: Optional[str] = None,
     concurrency: int = 5,
     model: str = "whisper-1",
@@ -614,24 +760,52 @@ async def process_files(
     if "json" not in formats:
         formats.insert(0, "json")  # Add json as the first format
     
-    # Filter files that need processing, or include all if force=True
+    # If force is enabled, process all files
     if force:
         files_to_process = files
         logger.info("Force flag enabled - processing all files regardless of existing outputs")
     else:
-        # Check each file to see if it needs processing
-        needs_processing_tasks = []
-        for file_path in files:
-            needs_processing_tasks.append(should_process_file(file_path, output_dir, formats, input))
+        # Pre-cache existing output files to avoid individual file checks
+        existing_files_cache = {}
+        if output_dir:
+            existing_files_cache = await get_existing_output_files(output_dir, formats)
         
-        # Wait for all checks to complete
-        needs_processing_results = await asyncio.gather(*needs_processing_tasks)
+        # Filter files that need processing
+        files_to_process = []
         
-        # Filter files based on results
-        files_to_process = [
-            file_path for file_path, needs_processing 
-            in zip(files, needs_processing_results) if needs_processing
-        ]
+        # Set up progress bar for checking files
+        check_progress = tqdm(
+            total=len(files),
+            desc="Checking files to process",
+            position=0,
+            leave=True
+        )
+        
+        # Process files in batches to avoid memory issues with large file lists
+        batch_size = 1000
+        for i in range(0, len(files), batch_size):
+            batch = files[i:i+batch_size]
+            
+            # Check each file in the batch
+            needs_processing_tasks = []
+            for file_path in batch:
+                needs_processing_tasks.append(
+                    should_process_file_with_cache(
+                        file_path, output_dir, formats, existing_files_cache, input
+                    )
+                )
+            
+            # Wait for all checks in this batch to complete
+            needs_processing_results = await asyncio.gather(*needs_processing_tasks)
+            
+            # Filter files based on results
+            for file_path, needs_processing in zip(batch, needs_processing_results):
+                if needs_processing:
+                    files_to_process.append(file_path)
+                check_progress.update(1)
+        
+        # Close progress bar
+        check_progress.close()
     
     if not files_to_process:
         logger.info("No files need processing - all output files already exist")
@@ -688,7 +862,7 @@ def ensure_output_dir(output_dir: Optional[str]) -> None:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
 
-async def collect_files(input_path: str, recursive: bool) -> List[Union[str, Path]]:
+async def collect_files(input_path: str, recursive: bool) -> List[str]:
     """Collect audio files from any supported storage system."""
     # Use the appropriate storage manager
     storage = get_storage_manager(input_path)
@@ -696,7 +870,7 @@ async def collect_files(input_path: str, recursive: bool) -> List[Union[str, Pat
     try:
         # For S3 storage, we need to use pagination which naturally gives us incremental updates
         if isinstance(storage, S3StorageManager):
-            files = []
+            s3_files: List[str] = []
             parsed = urlparse(input_path)
             bucket = parsed.netloc
             prefix = parsed.path.lstrip('/')
@@ -729,14 +903,16 @@ async def collect_files(input_path: str, recursive: bool) -> List[Union[str, Pat
                             
                             # Filter by audio extensions
                             if any(key.lower().endswith(ext) for ext in AUDIO_EXTENSIONS):
-                                files.append(f"s3://{bucket}/{key}")
+                                s3_files.append(f"s3://{bucket}/{key}")
                                 progress.update(1)
             
             # Close the progress bar
             progress.close()
             
-            if not files:
+            if not s3_files:
                 print("No audio files found.")
+                
+            return s3_files
                 
         else:  # LocalStorageManager
             path_obj = Path(str(input_path))
@@ -749,7 +925,7 @@ async def collect_files(input_path: str, recursive: bool) -> List[Union[str, Pat
                     return []
             
             print(f"Searching for audio files in {input_path}...")
-            files = []
+            local_files: List[str] = []
             
             # Create a list of patterns for audio files
             patterns = [f"*{ext}" for ext in AUDIO_EXTENSIONS]
@@ -768,27 +944,27 @@ async def collect_files(input_path: str, recursive: bool) -> List[Union[str, Pat
                     glob_pattern = f"**/{pattern}"
                     for file_path in path_obj.glob(glob_pattern):
                         if file_path.is_file():  # Ensure it's a file
-                            files.append(str(file_path))
+                            local_files.append(str(file_path))
                             progress.update(1)
             else:
                 for pattern in patterns:
                     for file_path in path_obj.glob(pattern):
                         if file_path.is_file():  # Ensure it's a file
-                            files.append(str(file_path))
+                            local_files.append(str(file_path))
                             progress.update(1)
             
             # Close the progress bar
             progress.close()
             
-            if not files and path_obj.is_dir():
+            if not local_files and path_obj.is_dir():
                 print("No audio files found.")
                 logger.warning(
                     f"{input_path} is a directory with no audio files. "
                     f"Use --recursive to process subdirectories if needed."
                 )
-        
-        logger.info(f"Found {len(files)} audio files to process")
-        return files
+            
+            logger.info(f"Found {len(local_files)} audio files to process")
+            return local_files
         
     except Exception as e:
         logger.error(f"Error collecting files from {input_path}: {e}")
