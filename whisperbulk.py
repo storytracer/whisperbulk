@@ -408,7 +408,7 @@ async def process_file(
         raise
 
 
-async def scan_output_files(output_dir: AnyPath, formats: List[str]) -> Dict[str, bool]:
+async def scan_output_files(output_dir: AnyPath, formats: List[str]) -> Set[AnyPath]:
     """
     Efficiently scan and cache all existing output files in the output directory.
     
@@ -417,9 +417,8 @@ async def scan_output_files(output_dir: AnyPath, formats: List[str]) -> Dict[str
         formats: List of format extensions to look for
         
     Returns:
-        Dictionary mapping file paths to True for quick lookup
+        Set of existing output file paths for quick lookup
     """
-    existing_files: Dict[str, bool] = {}
     
     logger.info(f"Scanning existing output files in {output_dir}")
     progress = tqdm(desc="Scanning existing output files", unit="files", leave=True)
@@ -427,25 +426,28 @@ async def scan_output_files(output_dir: AnyPath, formats: List[str]) -> Dict[str
     # Create a combined pattern for faster scanning using rglob
     # This is much faster than calling list_files for each format
     try:
-        # Use AnyPath's rglob to efficiently find all matching files in one pass
-        for fmt in formats:
-            pattern = f"*.{fmt}"
-            for file_path in output_dir.rglob(pattern):
-                if file_path.is_file():  # Ensure we only include files, not directories
-                    existing_files[str(file_path)] = True
+        output_files = set()
+        existing_files = output_dir.rglob("*")
+        
+        for file_path in existing_files:
+            for fmt in formats:
+                if file_path.name.endswith(f".{fmt}"):
+                    output_files.add(file_path)
                     progress.update(1)
+                    break
+                
     except Exception as e:
         logger.warning(f"Error scanning output directory {output_dir}: {e}")
     
     progress.close()
-    logger.info(f"Found {len(existing_files)} existing output files in {output_dir}")
-    return existing_files
+    logger.info(f"Found {len(output_files)} existing output files in {output_dir}")
+    return output_files
 
 
 def check_file_needs_processing(
     file_path: AnyPath,
     derivatives: Optional[List[str]],
-    existing_files_cache: Dict[str, bool],
+    existing_files_cache: Set[AnyPath],
     output_dir: AnyPath,
     input_dir: AnyPath
 ) -> tuple[bool, bool, Set[str]]:
@@ -471,14 +473,14 @@ def check_file_needs_processing(
     
     # Get path to JSON transcription
     json_path = get_output_path(file_path, "json", output_dir, input_dir)
-    needs_transcription = str(json_path) not in existing_files_cache
+    needs_transcription = json_path not in existing_files_cache
     
     # Check which derivatives are missing
     missing_derivatives = set()
     if derivatives:
         for fmt in derivatives:
             output_path = get_output_path(file_path, fmt, output_dir, input_dir)
-            if str(output_path) not in existing_files_cache:
+            if output_path not in existing_files_cache:
                 missing_derivatives.add(fmt)
     
     needs_derivatives = len(missing_derivatives) > 0
@@ -518,7 +520,7 @@ async def process_files(
     
     # Step 1: Scan for existing output files if not in force mode
     scan_formats = ["json"] + validated_derivatives
-    existing_files_cache = {}
+    existing_files_cache: Set[AnyPath] = set()
     if not force:
         existing_files_cache = await scan_output_files(output_dir, scan_formats)
     
