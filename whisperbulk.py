@@ -320,8 +320,9 @@ def get_output_path(
         # Get the input file's parent directory to extract the relative path structure
         try:
             # Use relative_to to get the subdirectory structure
-            rel_path = file_path.parent.relative_to(file_path.drive or "/")
-            output_path = output_dir / rel_path / f"{file_stem}.{fmt}"
+            rel_path = file_path.relative_to(file_path)
+            output_path = output_dir / rel_path.parent / f"{file_stem}.{fmt}"
+            print(output_path)
         except ValueError:
             # If we can't determine the relative path, just use the filename
             output_path = output_dir / f"{file_stem}.{fmt}"
