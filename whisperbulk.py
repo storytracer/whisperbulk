@@ -363,80 +363,6 @@ async def save_derivative(
     logger.info(f"Saved {format_name.upper()} derivative to {output_path}")
 
 
-def get_path_structure_components(path: Union[str, Path]) -> tuple[str, Optional[str], Path, str]:
-    """
-    Extract storage-agnostic components from a path for uniform handling.
-    
-    Args:
-        path: The path to extract components from
-        
-    Returns:
-        Tuple of (scheme, bucket, rel_path, filename):
-        - scheme: 's3' or 'local'
-        - bucket: S3 bucket name or None for local paths
-        - rel_path: Path object representing the directory structure without filename 
-        - filename: The basename of the file
-    """
-    if isinstance(path, str) and is_s3_path(path):
-        parsed = urlparse(path)
-        bucket = parsed.netloc
-        full_path = Path(parsed.path.lstrip('/'))
-        rel_path = full_path.parent
-        filename = full_path.name
-        return 's3', bucket, rel_path, filename
-    else:
-        path_obj = Path(str(path))
-        return 'local', None, path_obj.parent, path_obj.name
-
-
-def get_relative_structure(file_path: Union[str, Path], base_path: str = "") -> Path:
-    """
-    Calculate the relative path structure between a file and a base path.
-    
-    Args:
-        file_path: Path to the file
-        base_path: Base path to compute relative path from
-        
-    Returns:
-        Path object representing the relative directory structure
-    """
-    # Handle empty or missing base path
-    if not base_path:
-        _, _, rel_path, _ = get_path_structure_components(file_path)
-        return rel_path
-        
-    # Get components for both paths
-    file_scheme, file_bucket, file_rel_path, file_name = get_path_structure_components(file_path)
-    base_scheme, base_bucket, base_rel_path, base_name = get_path_structure_components(base_path)
-    
-    # If schemes don't match or buckets don't match (for S3), use file's path
-    if file_scheme != base_scheme or (file_scheme == 's3' and file_bucket != base_bucket):
-        return file_rel_path
-        
-    # Convert base path to directory if it's a file
-    if base_name and base_name != "":  # If base path points to a file
-        base_parts = list(base_rel_path.parts)
-    else:  # Base path is already a directory
-        base_parts = list(base_rel_path.parts)
-        
-    # Get parts for file's path
-    file_parts = list(file_rel_path.parts)
-    
-    # Find common prefix
-    common_length = 0
-    for i in range(min(len(base_parts), len(file_parts))):
-        if base_parts[i] == file_parts[i]:
-            common_length += 1
-        else:
-            break
-    
-    # Extract relative parts (everything after the common prefix)
-    rel_parts = file_parts[common_length:]
-    
-    # Return relative path (or '.' if empty)
-    return Path(*rel_parts) if rel_parts else Path('.')
-
-
 def get_output_path(
     file_path: Union[str, Path],
     fmt: str,
@@ -444,57 +370,89 @@ def get_output_path(
     input_base_path: str = ""
 ) -> str:
     """
-    Generate the output path for a given file and format, preserving directory structure.
+    Generate the output path for a given file and format, preserving relative path structure.
     
     Args:
         file_path: The input audio file path
         fmt: The format extension (json, txt, srt)
-        output_dir: Optional output directory, if not specified will save alongside input
-        input_base_path: Original input path to correctly preserve directory structure
+        output_dir: Optional output directory
+        input_base_path: Original input path base
         
     Returns:
         The full output path for the given format
     """
-    # Get components of the file path
-    file_scheme, file_bucket, _, file_name = get_path_structure_components(file_path)
-    file_stem = Path(file_name).stem
-    
-    # Calculate relative path structure
-    rel_structure = get_relative_structure(file_path, input_base_path)
-    
     # If no output directory specified, save alongside input
     if not output_dir:
-        if file_scheme == 's3':
+        if isinstance(file_path, str) and is_s3_path(file_path):
             # For S3, construct path in same bucket/prefix
-            s3_path = Path(urlparse(str(file_path)).path.lstrip('/'))
-            parent_path = s3_path.parent
-            return f"s3://{file_bucket}/{parent_path}/{file_stem}.{fmt}"
+            parsed = urlparse(file_path)
+            bucket = parsed.netloc
+            pure_path = Path(parsed.path.lstrip('/'))
+            parent_path = pure_path.parent
+            file_stem = pure_path.stem
+            return f"s3://{bucket}/{parent_path}/{file_stem}.{fmt}"
         else:
             # For local files, use same directory with new extension
             return str(Path(str(file_path)).with_suffix(f".{fmt}"))
+    
+    # Get file stem
+    if isinstance(file_path, str) and is_s3_path(file_path):
+        file_pure_path = Path(urlparse(file_path).path.lstrip('/'))
+    else:
+        file_pure_path = Path(str(file_path))
+    
+    file_stem = file_pure_path.stem
+    
+    # Calculate relative path structure if base path is provided
+    rel_path = Path()
+    
+    if input_base_path:
+        # Get path without protocol for both file and base
+        if isinstance(file_path, str) and is_s3_path(file_path):
+            file_pure_path = Path(urlparse(file_path).path.lstrip('/'))
+        else:
+            file_pure_path = Path(str(file_path))
+            
+        if isinstance(input_base_path, str) and is_s3_path(input_base_path):
+            base_pure_path = Path(urlparse(input_base_path).path.lstrip('/'))
+        else:
+            base_pure_path = Path(str(input_base_path))
+        
+        # Make sure base_path is treated as a directory
+        if base_pure_path.suffix:  # It's a file
+            base_pure_path = base_pure_path.parent
+        
+        # Get file's directory
+        file_dir = file_pure_path.parent
+        
+        # Calculate relative path
+        try:
+            # This is the key step - getting the proper relative path
+            if str(file_dir).startswith(str(base_pure_path)):
+                rel_path = file_dir.relative_to(base_pure_path)
+        except ValueError:
+            # If not a subpath, use empty relative path
+            rel_path = Path()
     
     # With output directory specified
     if isinstance(output_dir, str) and is_s3_path(output_dir):
         # S3 output
         parsed = urlparse(output_dir)
         bucket = parsed.netloc
-        prefix = Path(parsed.path.lstrip('/'))
+        prefix = parsed.path.lstrip('/')
         
-        # Combine output prefix with relative structure
-        if str(rel_structure) != '.':
-            output_prefix = prefix / rel_structure
+        # Combine with relative path if it exists
+        if rel_path != Path() and str(rel_path) != '.':
+            return f"s3://{bucket}/{prefix}/{rel_path}/{file_stem}.{fmt}"
         else:
-            output_prefix = prefix
-            
-        # Construct full S3 path
-        return f"s3://{bucket}/{output_prefix}/{file_stem}.{fmt}"
+            return f"s3://{bucket}/{prefix}/{file_stem}.{fmt}"
     else:
         # Local output
         output_path = Path(output_dir)
         
-        # Combine output dir with relative structure
-        if str(rel_structure) != '.':
-            full_output_path = output_path / rel_structure
+        # Combine with relative path if it exists
+        if rel_path != Path() and str(rel_path) != '.':
+            full_output_path = output_path / rel_path
         else:
             full_output_path = output_path
             
