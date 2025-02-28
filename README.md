@@ -9,6 +9,7 @@ A CLI tool for bulk transcribing audio files using OpenAI's Whisper API.
 - Configurable concurrency level
 - Automatic retries with exponential backoff
 - Progress bar to track transcription status
+- Generates JSON transcriptions with optional derivative formats (TXT, SRT)
 
 ## Installation
 
@@ -82,21 +83,19 @@ whisperbulk ./audio_files s3://mybucket/transcriptions -r
 - `-c, --concurrency` - Number of concurrent transcription requests (default: 5)
 - `-r, --recursive` - Recursively process directories
 - `-v, --verbose` - Enable verbose logging
-- `-f, --format` - Output format for transcriptions (default: txt, options: txt, json, srt). This option can be used multiple times to generate multiple output formats for each file.
+- `-d, --derivative` - Generate derivative formats (options: txt, srt). This option can be used multiple times.
+- `-m, --model` - Whisper model to use (default: whisper-1)
+- `--force` - Process all files regardless of existing outputs
 
-### Examples with Multiple Formats
+### Examples with Derivative Formats
 
-Generate both text and SRT format transcriptions:
-
-```bash
-whisperbulk ./audio_files ./transcriptions -f txt -f srt
-```
-
-Generate all supported formats:
+Generate both text and SRT derivative formats:
 
 ```bash
-whisperbulk ./audio_files ./transcriptions -f txt -f json -f srt
+whisperbulk ./audio_files ./transcriptions -d txt -d srt
 ```
+
+By default, all audio files are transcribed to JSON format. Derivatives are optional additional formats created from the JSON transcriptions.
 
 ## License
 

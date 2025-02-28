@@ -13,7 +13,7 @@ import aiofiles
 import srt
 import datetime
 from pathlib import Path
-from typing import List, Optional, Union, Any, Dict, Literal
+from typing import List, Optional, Union, Any, Dict, Literal, Set
 from urllib.parse import urlparse
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
@@ -26,6 +26,7 @@ from tqdm import tqdm
 
 # Constants
 AUDIO_EXTENSIONS = (".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm")
+DERIVATIVE_FORMATS = ["txt", "srt"]
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -234,9 +235,6 @@ def get_storage_manager(path: Union[str, Path]) -> StorageManager:
         return LocalStorageManager()
 
 
-# We don't need a custom file-like class anymore as we'll use temporary files
-
-
 @tenacity.retry(
     retry=tenacity.retry_if_exception_type(Exception),
     wait=tenacity.wait_exponential(multiplier=1, min=4, max=60),
@@ -246,7 +244,7 @@ def get_storage_manager(path: Union[str, Path]) -> StorageManager:
         f"{retry_state.outcome.exception() if retry_state.outcome else 'Unknown error'}"
     ),
 )
-async def transcribe_file(file_path: Union[str, Path], model: str) -> Any:
+async def transcribe_file(file_path: Union[str, Path], model: str) -> Dict:
     """Transcribe a single audio file using the specified Whisper model with retry logic."""
     logger.info(f"Transcribing {file_path} with model {model}")
     
@@ -270,7 +268,7 @@ async def transcribe_file(file_path: Union[str, Path], model: str) -> Any:
                     model=model,
                     response_format="verbose_json"
                 )
-            return response
+            return response.model_dump() if hasattr(response, "model_dump") else response
         finally:
             # Clean up the temporary file
             if temp_file_path.exists():
@@ -283,79 +281,26 @@ async def transcribe_file(file_path: Union[str, Path], model: str) -> Any:
                 model=model,
                 response_format="verbose_json"
             )
-        return response
+        return response.model_dump() if hasattr(response, "model_dump") else response
 
 
-from abc import ABC, abstractmethod
-
-class OutputFormat(ABC):
-    """Abstract base class for output formats."""
-    
-    # Define supported formats
-    FORMATS = ["json", "txt", "srt"]
+class DerivativeConverter:
+    """
+    Handles conversion from JSON transcription data to derivative formats.
+    """
     
     @staticmethod
-    def get_formatter(format_name: str) -> 'OutputFormat':
-        """Factory method to get the appropriate format handler."""
-        if format_name == "json":
-            return JsonFormat()
-        elif format_name == "txt":
-            return TextFormat()
-        elif format_name == "srt":
-            return SrtFormat()
-        else:
-            raise ValueError(f"Unsupported format: {format_name}")
+    def to_text(transcription_data: Dict) -> str:
+        """Convert JSON transcription data to plain text."""
+        return transcription_data.get("text", "")
     
-    @abstractmethod
-    def format_content(self, data: Any) -> str:
-        """Format data into the target format."""
-        pass
-    
-    @property
-    @abstractmethod
-    def extension(self) -> str:
-        """Get the file extension for this format."""
-        pass
-
-
-class JsonFormat(OutputFormat):
-    """JSON output format handler."""
-    
-    def format_content(self, data: Any) -> str:
-        """Format data as JSON."""
-        # Extract data from different result types
-        processed_data = None
-        if hasattr(data, "model_dump"):
-            processed_data = data.model_dump()
-        elif isinstance(data, dict):
-            processed_data = data
-        elif isinstance(data, str):
-            processed_data = {"text": data}
-        else:
-            processed_data = {"text": str(data)}
-            
-        # Convert to JSON string
-        return json.dumps(processed_data, indent=2, ensure_ascii=False)
-    
-    @property
-    def extension(self) -> str:
-        return "json"
-    
-    def convert_to_text(self, data: dict) -> str:
-        """Convert JSON data to plain text."""
-        return data.get("text", str(data))
-    
-    def convert_to_srt(self, data: dict) -> str:
-        """Convert JSON data to SRT format."""
-        segments = data.get("segments", [])
-        if segments:
-            return self._segments_to_srt(segments)
-        else:
-            # Fallback if no segments available
-            return data.get("text", str(data))
-    
-    def _segments_to_srt(self, segments: List[Dict]) -> str:
-        """Convert segments to SRT subtitle format using the srt library."""
+    @staticmethod
+    def to_srt(transcription_data: Dict) -> str:
+        """Convert JSON transcription data to SRT subtitle format."""
+        segments = transcription_data.get("segments", [])
+        if not segments:
+            return transcription_data.get("text", "")
+        
         subtitle_entries = []
         
         for i, segment in enumerate(segments, 1):
@@ -382,65 +327,40 @@ class JsonFormat(OutputFormat):
         return srt.compose(subtitle_entries)
 
 
-class TextFormat(OutputFormat):
-    """Plain text output format handler."""
-    
-    def format_content(self, data: Any) -> str:
-        """Format data as plain text."""
-        # Handle different input types
-        if isinstance(data, dict):
-            return data.get("text", str(data))
-        elif isinstance(data, str):
-            return data
-        else:
-            return str(data)
-    
-    @property
-    def extension(self) -> str:
-        return "txt"
-
-
-class SrtFormat(OutputFormat):
-    """SRT subtitle output format handler."""
-    
-    def format_content(self, data: Any) -> str:
-        """Format data as SRT."""
-        # For SRT, we need segment information
-        if isinstance(data, dict):
-            segments = data.get("segments", [])
-            if segments:
-                # Use JsonFormat's helper method to convert segments to SRT
-                return JsonFormat()._segments_to_srt(segments)
-            else:
-                # Fallback if no segments available
-                return data.get("text", str(data))
-        elif isinstance(data, str):
-            return data
-        else:
-            return str(data)
-    
-    @property
-    def extension(self) -> str:
-        return "srt"
-
-
-async def save_transcription(
-    result: Any, 
-    output_path: Union[str, Path], 
-    format_name: Literal["json", "txt", "srt"] = "json"
+async def save_json_transcription(
+    transcription_data: Dict,
+    output_path: Union[str, Path]
 ) -> None:
-    """Save transcription results to a file in the specified format."""
-    # Get the appropriate formatter
-    formatter = OutputFormat.get_formatter(format_name)
-    
-    # Format the content
-    content = formatter.format_content(result)
+    """Save transcription results as JSON."""
+    # Format as JSON string
+    content = json.dumps(transcription_data, indent=2, ensure_ascii=False)
     
     # Use the appropriate storage manager to write the file
     storage = get_storage_manager(output_path)
     await storage.write_text(output_path, content)
+    
+    logger.info(f"Saved JSON transcription to {output_path}")
 
-    logger.info(f"Saved transcription to {output_path} in {format_name} format")
+
+async def save_derivative(
+    transcription_data: Dict,
+    output_path: Union[str, Path],
+    format_name: Literal["txt", "srt"]
+) -> None:
+    """Save transcription results in a derivative format (txt or srt)."""
+    # Convert to the requested format
+    if format_name == "txt":
+        content = DerivativeConverter.to_text(transcription_data)
+    elif format_name == "srt":
+        content = DerivativeConverter.to_srt(transcription_data)
+    else:
+        raise ValueError(f"Unsupported derivative format: {format_name}")
+    
+    # Use the appropriate storage manager to write the file
+    storage = get_storage_manager(output_path)
+    await storage.write_text(output_path, content)
+    
+    logger.info(f"Saved {format_name.upper()} derivative to {output_path}")
 
 
 def get_output_path(
@@ -530,30 +450,29 @@ def get_output_path(
             # For local input, use same directory
             return str(file_path_obj.with_suffix(f".{fmt}"))
 
+
 async def process_file(
     file_path: Union[str, Path],
     output_dir: Union[str, Path, None] = None,
     model: str = "whisper-1",
-    formats: List[Literal["json", "txt", "srt"]] = ["json"],
+    derivatives: Optional[List[Literal["txt", "srt"]]] = None,
     input_base_path: str = ""
 ) -> None:
     """
-    Process a single file and save the transcription in all requested formats.
+    Process a single file: transcribe to JSON and optionally create derivative formats.
     
     Args:
         file_path: Path to the audio file to process
         output_dir: Directory to save outputs (if None, saves alongside input)
         model: Whisper model to use for transcription
-        formats: Output formats to generate
+        derivatives: Derivative formats to generate (txt, srt)
         input_base_path: Original input path for preserving directory structure
     """
     try:
         logger.info(f"Processing file: {file_path}")
         
-        # Ensure json is always in the formats list
-        formats_to_process = list(set(formats))  # Remove duplicates
-        if "json" not in formats_to_process:
-            formats_to_process.insert(0, "json")  # Add json as the first format
+        # Set empty list if derivatives is None
+        derivatives_to_process = derivatives or []
         
         # Get JSON output path and check if it exists
         json_path = get_output_path(file_path, "json", output_dir, input_base_path)
@@ -561,7 +480,7 @@ async def process_file(
         json_exists = await json_storage.exists(json_path)
         
         # Initialize results and tasks
-        transcription_result = None
+        transcription_data = None
         save_tasks = []
         
         # STEP 1: Try to use existing JSON if possible
@@ -571,50 +490,42 @@ async def process_file(
             try:
                 json_content = await json_storage.read_binary(json_path)
                 json_text = json_content.decode('utf-8')
-                transcription_result = json.loads(json_text)
-                
-                # If only JSON was requested and it exists, we're done
-                if len(formats) == 1 and "json" in formats:
-                    logger.info(f"Skipping {file_path} as JSON already exists")
-                    return
+                transcription_data = json.loads(json_text)
             except json.JSONDecodeError as e:
                 logger.error(f"Error parsing existing JSON file {json_path}: {e}")
-                transcription_result = None  # Force re-transcription
+                transcription_data = None  # Force re-transcription
         
         # STEP 2: If no valid JSON exists, perform transcription
-        if not json_exists or transcription_result is None:
+        if not json_exists or transcription_data is None:
             logger.info(f"Transcribing: {file_path}")
-            transcription_result = await transcribe_file(file_path, model)
+            transcription_data = await transcribe_file(file_path, model)
             
-            # Always save JSON result (used as cache for other formats)
-            save_tasks.append(save_transcription(
-                transcription_result, 
-                json_path, 
-                "json"
+            # Save JSON result
+            save_tasks.append(save_json_transcription(
+                transcription_data, 
+                json_path
             ))
         
-        # STEP 3: Convert to other requested formats if needed
-        json_formatter = JsonFormat()
-        for fmt in formats:
-            if fmt != "json":  # Skip JSON as we've already handled it
-                output_path = get_output_path(file_path, fmt, output_dir, input_base_path)
-                
-                # Check if this format already exists
-                output_storage = get_storage_manager(output_path)
-                if not await output_storage.exists(output_path):
-                    logger.info(f"Converting to {fmt} format: {output_path}")
-                    save_tasks.append(save_transcription(
-                        transcription_result,
-                        output_path,
-                        fmt
-                    ))
+        # STEP 3: Create derivative formats if requested
+        for fmt in derivatives_to_process:
+            output_path = get_output_path(file_path, fmt, output_dir, input_base_path)
+            
+            # Check if this derivative already exists
+            output_storage = get_storage_manager(output_path)
+            if not await output_storage.exists(output_path):
+                logger.info(f"Creating {fmt} derivative: {output_path}")
+                save_tasks.append(save_derivative(
+                    transcription_data,
+                    output_path,
+                    fmt
+                ))
         
         # Run all save tasks concurrently for better performance
         if save_tasks:
             await asyncio.gather(*save_tasks)
             logger.info(f"Completed processing {file_path}")
         else:
-            logger.info(f"No new formats to generate for {file_path}")
+            logger.info(f"No new outputs to generate for {file_path}")
 
     except Exception as e:
         logger.error(f"Error processing {file_path}: {e}")
@@ -659,64 +570,57 @@ async def scan_output_files(output_dir: Optional[str], formats: List[str]) -> Di
     logger.info(f"Found {len(existing_files)} existing output files in {output_dir}")
     return existing_files
 
+
 def check_file_needs_processing(
     file_path: Union[str, Path],
-    formats: List[str],
+    derivatives: Optional[List[str]],
     existing_files_cache: Dict[str, bool],
     output_dir: Optional[Union[str, Path]],
     input_base_path: str = ""
-) -> tuple[bool, set[str]]:
+) -> tuple[bool, bool, Set[str]]:
     """
-    Check if a file needs to be processed based on existing output files.
+    Check if a file needs transcription and/or derivative creation.
     
     Args:
         file_path: Path to the audio file to check
-        formats: List of formats to generate
+        derivatives: List of derivative formats to generate
         existing_files_cache: Cache of existing output files
         output_dir: Output directory for generated files
         input_base_path: Original input path for preserving structure
         
     Returns:
-        Tuple of (needs_processing, missing_formats) where:
-        - needs_processing: True if any format needs to be generated
-        - missing_formats: Set of formats that need to be generated
+        Tuple of (needs_transcription, needs_derivatives, missing_derivatives) where:
+        - needs_transcription: True if JSON transcription needs to be generated
+        - needs_derivatives: True if any derivative format needs to be generated
+        - missing_derivatives: Set of derivative formats that need to be generated
     """
     # If no cache (force mode), process everything
     if not existing_files_cache:
-        return True, set(formats)
+        return True, bool(derivatives), set(derivatives or [])
     
-    # Ensure formats is a set for faster lookups
-    requested_formats = set(formats)
+    # Get path to JSON transcription
+    json_path = get_output_path(file_path, "json", output_dir, input_base_path)
+    needs_transcription = json_path not in existing_files_cache
     
-    # JSON is our primary format and cache for other formats
-    if "json" not in requested_formats:
-        requested_formats.add("json")
+    # Check which derivatives are missing
+    missing_derivatives = set()
+    if derivatives:
+        for fmt in derivatives:
+            output_path = get_output_path(file_path, fmt, output_dir, input_base_path)
+            if output_path not in existing_files_cache:
+                missing_derivatives.add(fmt)
     
-    # Check which formats are missing
-    missing_formats = set()
-    for fmt in requested_formats:
-        output_path = get_output_path(file_path, fmt, output_dir, input_base_path)
-        if output_path not in existing_files_cache:
-            missing_formats.add(fmt)
+    needs_derivatives = len(missing_derivatives) > 0
     
-    # Determine if we need any processing at all
-    needs_processing = len(missing_formats) > 0
-    
-    # Special case: If JSON exists but other formats are missing,
-    # we only need to convert formats, not re-transcribe
-    if "json" not in missing_formats and len(missing_formats) > 0:
-        # Keep the missing non-JSON formats, but don't include JSON
-        # since we'll use the existing JSON for conversion
-        missing_formats.discard("json")
-    
-    return needs_processing, missing_formats
+    return needs_transcription, needs_derivatives, missing_derivatives
+
 
 async def process_files(
     files: List[str],
     output_dir: Optional[str] = None,
     concurrency: int = 5,
     model: str = "whisper-1",
-    formats: List[str] = ["json"],
+    derivatives: Optional[List[Literal["txt", "srt"]]] = None,
     force: bool = False,
     input_base_path: str = ""
 ) -> None:
@@ -728,31 +632,28 @@ async def process_files(
         output_dir: Directory to save output files
         concurrency: Number of concurrent transcription jobs
         model: Whisper model to use for transcription
-        formats: Output formats to generate
+        derivatives: Derivative formats to generate
         force: If True, process all files regardless of existing outputs
         input_base_path: Original input path for preserving directory structure
     """
-    # Validate formats against supported list
-    supported_formats = set(OutputFormat.FORMATS)
-    requested_formats = []
-    for fmt in formats:
-        if fmt in supported_formats:
-            requested_formats.append(fmt)
-        else:
-            logger.warning(f"Ignoring unsupported format: {fmt}")
+    # Ensure derivatives is a list or None
+    validated_derivatives = derivatives or []
     
-    # If no valid formats specified, use JSON as default
-    if not requested_formats:
-        requested_formats = ["json"]
+    # Validate derivatives against supported list
+    for fmt in validated_derivatives:
+        if fmt not in DERIVATIVE_FORMATS:
+            logger.warning(f"Ignoring unsupported derivative format: {fmt}")
+            validated_derivatives.remove(fmt)
     
     # Step 1: Scan for existing output files if not in force mode
+    scan_formats = ["json"] + validated_derivatives
     existing_files_cache = {}
     if not force and output_dir:
-        existing_files_cache = await scan_output_files(output_dir, requested_formats)
+        existing_files_cache = await scan_output_files(output_dir, scan_formats)
     
     # Step 2: Determine which files need processing
     files_to_process = []
-    processing_info = []  # Store (file_path, needs_processing, missing_formats)
+    processing_info = []  # Store (file_path, needs_transcription, missing_derivatives)
     
     # Set up progress bar for checking files
     check_progress = tqdm(
@@ -765,14 +666,14 @@ async def process_files(
     # Check files in batches to avoid memory issues with large file lists
     for file_path in files:
         # Check if file needs processing and which formats are missing
-        needs_processing, missing_formats = check_file_needs_processing(
-            file_path, requested_formats, existing_files_cache, 
+        needs_transcription, needs_derivatives, missing_derivatives = check_file_needs_processing(
+            file_path, validated_derivatives, existing_files_cache, 
             output_dir, input_base_path
         )
         
-        if needs_processing:
+        if needs_transcription or needs_derivatives:
             files_to_process.append(file_path)
-            processing_info.append((file_path, missing_formats))
+            processing_info.append((file_path, needs_transcription, missing_derivatives))
         
         check_progress.update(1)
     
@@ -790,11 +691,20 @@ async def process_files(
     # Step 3: Process files concurrently with semaphore to limit API calls
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def _process_with_semaphore(file_path, missing_fmts):
+    async def _process_with_semaphore(file_path, needs_transcription, missing_derivatives):
         async with semaphore:
-            # Only include formats that are missing or all if force mode
-            formats_to_use = list(missing_fmts) if missing_fmts else requested_formats
-            return await process_file(file_path, output_dir, model, formats_to_use, input_base_path)
+            # If we don't need to transcribe or generate derivatives, skip this file
+            if not needs_transcription and not missing_derivatives:
+                return
+                
+            # Process the file with the required derivatives
+            return await process_file(
+                file_path, 
+                output_dir, 
+                model, 
+                list(missing_derivatives) if not needs_transcription else validated_derivatives,
+                input_base_path
+            )
 
     # Set up progress bar for processing
     progress = tqdm(
@@ -805,9 +715,9 @@ async def process_files(
     )
     
     async def process_and_update(file_info):
-        file_path, missing_formats = file_info
+        file_path, needs_transcription, missing_derivatives = file_info
         try:
-            await _process_with_semaphore(file_path, missing_formats)
+            await _process_with_semaphore(file_path, needs_transcription, missing_derivatives)
         except Exception as e:
             logger.error(f"Failed to process {file_path}: {e}")
         finally:
@@ -996,15 +906,15 @@ def check_aws_credentials(uses_s3: bool) -> None:
     help="Model to use for transcription"
 )
 @click.option(
-    "--format", "-f", default=["json"], multiple=True, 
-    type=click.Choice(OutputFormat.FORMATS),
-    help="Output format(s) for transcriptions (can be used multiple times)"
+    "--derivative", "-d", multiple=True, 
+    type=click.Choice(DERIVATIVE_FORMATS),
+    help="Derivative format(s) to generate from JSON transcriptions (can be used multiple times)"
 )
 @click.option(
     "--force", is_flag=True,
     help="Force processing of all files, even if output files already exist"
 )
-def main(input_path, output_path, concurrency, recursive, verbose, log_file, model, format, force):
+def main(input_path, output_path, concurrency, recursive, verbose, log_file, model, derivative, force):
     """Bulk transcribe audio files using Whisper models.
 
     INPUT_PATH is the source directory or file (or s3:// URI).
@@ -1016,19 +926,17 @@ def main(input_path, output_path, concurrency, recursive, verbose, log_file, mod
     don't already have corresponding output files for all requested formats.
     Use --force to process all files regardless of existing outputs.
 
-    The tool generates JSON format output (containing full transcription data) 
-    and uses this as a cache for generating other formats. If you request 
-    multiple formats and the JSON file already exists, it will convert from that
-    instead of re-transcribing the audio file.
+    The tool generates JSON transcriptions and optionally creates derivative 
+    formats (txt or srt) from these transcriptions.
 
     Example usage:
 
         whisperbulk ./audio_files ./transcriptions -c 10 -r
-        whisperbulk s3://mybucket/audio s3://mybucket/transcriptions -m whisper-1 -f srt
+        whisperbulk s3://mybucket/audio s3://mybucket/transcriptions -m whisper-1 -d srt
         
-    You can specify multiple output formats:
+    You can specify multiple derivative formats:
     
-        whisperbulk ./audio_files ./transcriptions -f txt -f srt -f json
+        whisperbulk ./audio_files ./transcriptions -d txt -d srt
         
     To reprocess all files regardless of existing outputs:
     
@@ -1081,12 +989,8 @@ def main(input_path, output_path, concurrency, recursive, verbose, log_file, mod
         )
         
         # Process files - convert tuple to list if necessary
-        formats_list = list(format) if isinstance(format, tuple) else format
+        derivatives_list = list(derivative) if isinstance(derivative, tuple) else derivative
         
-        # Ensure we have at least one format
-        if not formats_list:
-            formats_list = ["json"]
-            
         # Log resumable mode (unless force is enabled)
         if not force:
             logger.info("Running in resumable mode - will skip files that already have outputs")
@@ -1097,12 +1001,17 @@ def main(input_path, output_path, concurrency, recursive, verbose, log_file, mod
             output_path, 
             concurrency, 
             model, 
-            formats_list, 
+            derivatives_list, 
             force, 
             input_path
         )
         
-        logger.info(f"All files processed successfully in format(s): {', '.join(formats_list)}")
+        # Log completion message with appropriate format information
+        if derivatives_list:
+            derivative_formats = ', '.join(derivatives_list)
+            logger.info(f"All files processed successfully with JSON transcriptions and {derivative_formats} derivatives")
+        else:
+            logger.info("All files processed successfully with JSON transcriptions")
     
     # Run the async pipeline
     asyncio.run(run_pipeline())
