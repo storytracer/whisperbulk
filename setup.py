@@ -17,6 +17,7 @@ setup(
         "aiofiles",
         "aiobotocore",
         "srt",  # For SRT subtitle file generation
+        "cloudpathlib>=0.15.0",  # For unified path handling (local and cloud)
     ],
     extras_require={
         "dev": [
@@ -24,6 +25,7 @@ setup(
             "mypy",
             "types-aiofiles",
             "types-tqdm",
+            "types-cloudpathlib",
         ],
     },
     entry_points={
