@@ -301,8 +301,7 @@ async def save_derivative(
 def get_output_path(
     file_path: AnyPath,
     fmt: str,
-    output_dir: Optional[AnyPath] = None,
-    input_base_path: AnyPath = None
+    output_dir: Optional[AnyPath] = None
 ) -> AnyPath:
     """
     Generate the output path for a given file and format, preserving relative path structure.
@@ -311,50 +310,21 @@ def get_output_path(
         file_path: The input audio file path
         fmt: The format extension (json, txt, srt)
         output_dir: Optional output directory
-        input_base_path: Original input path base
         
     Returns:
         The full output path for the given format
     """
     file_stem = file_path.stem
     
-    # Get relative path for preserving directory structure
-    def get_relative_path() -> AnyPath:
-        # Default to current directory if input_base_path is None
-        if input_base_path is None:
-            return AnyPath(".")
-            
-        input_base = input_base_path
-        if input_base.is_file():
-            input_base = input_base.parent
-            
-        # Get relative path from input base to file
-        try:
-            # Convert both to string representations
-            file_str = str(file_path)
-            base_str = str(input_base)
-            
-            # Check if file path starts with the base path
-            if file_str.startswith(base_str):
-                # Extract the relative part
-                rel_part = file_str[len(base_str):].lstrip('/')
-                return AnyPath(rel_part).parent
-                
-            return AnyPath(".")
-        except Exception:
-            # If path computation fails, just use filename
-            return AnyPath(".")
-    
     if output_dir:
-        # Preserve directory structure relative to input path
-        rel_path = get_relative_path()
-        
-        if str(rel_path) == ".":
-            # Just output to the root of output_dir
-            output_path = output_dir / f"{file_stem}.{fmt}"
-        else:
-            # Add relative path components to preserve structure
+        # Get the input file's parent directory to extract the relative path structure
+        try:
+            # Use relative_to to get the subdirectory structure
+            rel_path = file_path.parent.relative_to(file_path.drive or "/")
             output_path = output_dir / rel_path / f"{file_stem}.{fmt}"
+        except ValueError:
+            # If we can't determine the relative path, just use the filename
+            output_path = output_dir / f"{file_stem}.{fmt}"
         
         # Ensure the directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -369,8 +339,7 @@ async def process_file(
     file_path: AnyPath,
     output_dir: Optional[AnyPath] = None,
     model: str = "whisper-1",
-    derivatives: Optional[List[Literal["txt", "srt"]]] = None,
-    input_base_path: AnyPath = None
+    derivatives: Optional[List[Literal["txt", "srt"]]] = None
 ) -> None:
     """
     Process a single file: transcribe to JSON and optionally create derivative formats.
@@ -380,7 +349,6 @@ async def process_file(
         output_dir: Directory to save outputs (if None, saves alongside input)
         model: Whisper model to use for transcription
         derivatives: Derivative formats to generate (txt, srt)
-        input_base_path: Original input path for preserving directory structure
     """
     try:
         logger.info(f"Processing file: {file_path}")
@@ -389,7 +357,7 @@ async def process_file(
         derivatives_to_process = derivatives or []
         
         # Get JSON output path and check if it exists
-        json_path = get_output_path(file_path, "json", output_dir, input_base_path)
+        json_path = get_output_path(file_path, "json", output_dir)
         json_storage = get_storage_manager(json_path)
         json_exists = await json_storage.exists(json_path)
         
@@ -422,7 +390,7 @@ async def process_file(
         
         # STEP 3: Create derivative formats if requested
         for fmt in derivatives_to_process:
-            output_path = get_output_path(file_path, fmt, output_dir, input_base_path)
+            output_path = get_output_path(file_path, fmt, output_dir)
             
             # Check if this derivative already exists
             output_storage = get_storage_manager(output_path)
@@ -488,8 +456,7 @@ def check_file_needs_processing(
     file_path: AnyPath,
     derivatives: Optional[List[str]],
     existing_files_cache: Dict[str, bool],
-    output_dir: Optional[AnyPath],
-    input_base_path: AnyPath = None
+    output_dir: Optional[AnyPath]
 ) -> tuple[bool, bool, Set[str]]:
     """
     Check if a file needs transcription and/or derivative creation.
@@ -499,7 +466,6 @@ def check_file_needs_processing(
         derivatives: List of derivative formats to generate
         existing_files_cache: Cache of existing output files
         output_dir: Output directory for generated files
-        input_base_path: Original input path for preserving structure
         
     Returns:
         Tuple of (needs_transcription, needs_derivatives, missing_derivatives) where:
@@ -512,14 +478,14 @@ def check_file_needs_processing(
         return True, bool(derivatives), set(derivatives or [])
     
     # Get path to JSON transcription
-    json_path = get_output_path(file_path, "json", output_dir, input_base_path)
+    json_path = get_output_path(file_path, "json", output_dir)
     needs_transcription = str(json_path) not in existing_files_cache
     
     # Check which derivatives are missing
     missing_derivatives = set()
     if derivatives:
         for fmt in derivatives:
-            output_path = get_output_path(file_path, fmt, output_dir, input_base_path)
+            output_path = get_output_path(file_path, fmt, output_dir)
             if str(output_path) not in existing_files_cache:
                 missing_derivatives.add(fmt)
     
@@ -534,8 +500,7 @@ async def process_files(
     concurrency: int = 5,
     model: str = "whisper-1",
     derivatives: Optional[List[Literal["txt", "srt"]]] = None,
-    force: bool = False,
-    input_base_path: AnyPath = None
+    force: bool = False
 ) -> None:
     """
     Process multiple files concurrently, skipping files that already have outputs unless force=True.
@@ -547,7 +512,6 @@ async def process_files(
         model: Whisper model to use for transcription
         derivatives: Derivative formats to generate
         force: If True, process all files regardless of existing outputs
-        input_base_path: Original input path for preserving directory structure
     """
     # Ensure derivatives is a list or None
     validated_derivatives = derivatives or []
@@ -580,8 +544,7 @@ async def process_files(
     for file_path in files:
         # Check if file needs processing and which formats are missing
         needs_transcription, needs_derivatives, missing_derivatives = check_file_needs_processing(
-            file_path, validated_derivatives, existing_files_cache, 
-            output_dir, input_base_path
+            file_path, validated_derivatives, existing_files_cache, output_dir
         )
         
         if needs_transcription or needs_derivatives:
@@ -615,8 +578,7 @@ async def process_files(
                 file_path, 
                 output_dir, 
                 model, 
-                list(missing_derivatives) if not needs_transcription else validated_derivatives,
-                input_base_path
+                list(missing_derivatives) if not needs_transcription else validated_derivatives
             )
 
     # Set up progress bar for processing
@@ -836,8 +798,7 @@ def main(input_path, output_path, concurrency, recursive, verbose, log_file, mod
             concurrency, 
             model, 
             derivatives_list, 
-            force, 
-            input_path_obj
+            force
         )
         
         # Log completion message with appropriate format information
