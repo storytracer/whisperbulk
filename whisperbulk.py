@@ -286,330 +286,360 @@ async def transcribe_file(file_path: Union[str, Path], model: str) -> Any:
         return response
 
 
-def convert_to_srt(segments: List[Dict]) -> str:
-    """Convert segments to SRT subtitle format using the srt library."""
-    subtitle_entries = []
+from abc import ABC, abstractmethod
+
+class OutputFormat(ABC):
+    """Abstract base class for output formats."""
     
-    for i, segment in enumerate(segments, 1):
-        start = segment.get("start", 0)
-        end = segment.get("end", 0)
-        text = segment.get("text", "").strip()
+    # Define supported formats
+    FORMATS = ["json", "txt", "srt"]
+    
+    @staticmethod
+    def get_formatter(format_name: str) -> 'OutputFormat':
+        """Factory method to get the appropriate format handler."""
+        if format_name == "json":
+            return JsonFormat()
+        elif format_name == "txt":
+            return TextFormat()
+        elif format_name == "srt":
+            return SrtFormat()
+        else:
+            raise ValueError(f"Unsupported format: {format_name}")
+    
+    @abstractmethod
+    def format_content(self, data: Any) -> str:
+        """Format data into the target format."""
+        pass
+    
+    @property
+    @abstractmethod
+    def extension(self) -> str:
+        """Get the file extension for this format."""
+        pass
+
+
+class JsonFormat(OutputFormat):
+    """JSON output format handler."""
+    
+    def format_content(self, data: Any) -> str:
+        """Format data as JSON."""
+        # Extract data from different result types
+        processed_data = None
+        if hasattr(data, "model_dump"):
+            processed_data = data.model_dump()
+        elif isinstance(data, dict):
+            processed_data = data
+        elif isinstance(data, str):
+            processed_data = {"text": data}
+        else:
+            processed_data = {"text": str(data)}
+            
+        # Convert to JSON string
+        return json.dumps(processed_data, indent=2, ensure_ascii=False)
+    
+    @property
+    def extension(self) -> str:
+        return "json"
+    
+    def convert_to_text(self, data: dict) -> str:
+        """Convert JSON data to plain text."""
+        return data.get("text", str(data))
+    
+    def convert_to_srt(self, data: dict) -> str:
+        """Convert JSON data to SRT format."""
+        segments = data.get("segments", [])
+        if segments:
+            return self._segments_to_srt(segments)
+        else:
+            # Fallback if no segments available
+            return data.get("text", str(data))
+    
+    def _segments_to_srt(self, segments: List[Dict]) -> str:
+        """Convert segments to SRT subtitle format using the srt library."""
+        subtitle_entries = []
         
-        if text:
-            # Convert seconds to timedelta objects as required by srt library
-            start_time = datetime.timedelta(seconds=start)
-            end_time = datetime.timedelta(seconds=end)
+        for i, segment in enumerate(segments, 1):
+            start = segment.get("start", 0)
+            end = segment.get("end", 0)
+            text = segment.get("text", "").strip()
             
-            # Create a subtitle entry
-            subtitle = srt.Subtitle(
-                index=i,
-                start=start_time,
-                end=end_time,
-                content=text
-            )
-            
-            subtitle_entries.append(subtitle)
+            if text:
+                # Convert seconds to timedelta objects as required by srt library
+                start_time = datetime.timedelta(seconds=start)
+                end_time = datetime.timedelta(seconds=end)
+                
+                # Create a subtitle entry
+                subtitle = srt.Subtitle(
+                    index=i,
+                    start=start_time,
+                    end=end_time,
+                    content=text
+                )
+                
+                subtitle_entries.append(subtitle)
+        
+        # Compose the full SRT content
+        return srt.compose(subtitle_entries)
+
+
+class TextFormat(OutputFormat):
+    """Plain text output format handler."""
     
-    # Compose the full SRT content
-    return srt.compose(subtitle_entries)
+    def format_content(self, data: Any) -> str:
+        """Format data as plain text."""
+        # Handle different input types
+        if isinstance(data, dict):
+            return data.get("text", str(data))
+        elif isinstance(data, str):
+            return data
+        else:
+            return str(data)
+    
+    @property
+    def extension(self) -> str:
+        return "txt"
+
+
+class SrtFormat(OutputFormat):
+    """SRT subtitle output format handler."""
+    
+    def format_content(self, data: Any) -> str:
+        """Format data as SRT."""
+        # For SRT, we need segment information
+        if isinstance(data, dict):
+            segments = data.get("segments", [])
+            if segments:
+                # Use JsonFormat's helper method to convert segments to SRT
+                return JsonFormat()._segments_to_srt(segments)
+            else:
+                # Fallback if no segments available
+                return data.get("text", str(data))
+        elif isinstance(data, str):
+            return data
+        else:
+            return str(data)
+    
+    @property
+    def extension(self) -> str:
+        return "srt"
 
 
 async def save_transcription(
     result: Any, 
     output_path: Union[str, Path], 
-    format: Literal["json", "txt", "srt"] = "json"
+    format_name: Literal["json", "txt", "srt"] = "json"
 ) -> None:
     """Save transcription results to a file in the specified format."""
-    # Extract data from different result types
-    data = None
-    if hasattr(result, "model_dump"):
-        data = result.model_dump()
-    elif isinstance(result, dict):
-        data = result
-    elif isinstance(result, str):
-        data = {"text": result}
-    else:
-        data = {"text": str(result)}
+    # Get the appropriate formatter
+    formatter = OutputFormat.get_formatter(format_name)
     
-    # Prepare content based on format
-    content = ""
-    if format == "json":
-        # Convert to JSON string
-        content = json.dumps(data, indent=2, ensure_ascii=False)
-    elif format == "txt":
-        # Get plain text
-        content = data.get("text", str(data))
-    elif format == "srt":
-        # Convert to SRT subtitle format
-        segments = data.get("segments", [])
-        if segments:
-            content = convert_to_srt(segments)
-        else:
-            # Fallback if no segments available
-            content = data.get("text", str(data))
+    # Format the content
+    content = formatter.format_content(result)
     
     # Use the appropriate storage manager to write the file
     storage = get_storage_manager(output_path)
     await storage.write_text(output_path, content)
 
-    logger.info(f"Saved transcription to {output_path} in {format} format")
+    logger.info(f"Saved transcription to {output_path} in {format_name} format")
 
+
+def get_output_path(
+    file_path: Union[str, Path],
+    fmt: str,
+    output_dir: Optional[Union[str, Path]] = None,
+    input_base_path: str = ""
+) -> str:
+    """
+    Generate the output path for a given file and format, preserving directory structure.
+    
+    Args:
+        file_path: The input audio file path
+        fmt: The format extension (json, txt, srt)
+        output_dir: Optional output directory, if not specified will save alongside input
+        input_base_path: Original input path to correctly preserve directory structure
+        
+    Returns:
+        The full output path for the given format
+    """
+    file_path_obj = Path(str(file_path))
+    file_stem = file_path_obj.stem
+    
+    # Get relative path for preserving directory structure
+    def get_relative_path():
+        if isinstance(file_path, str) and is_s3_path(file_path):
+            parsed = urlparse(file_path)
+            key = parsed.path.lstrip('/')
+            input_path_obj = Path(key)
+            # Get parent directories to preserve structure
+            return input_path_obj.parent
+        else:
+            # For local paths, get input directory
+            input_base = Path(input_base_path)
+            if input_base.is_file():
+                input_base = input_base.parent
+            # Get relative path from input base to file
+            try:
+                # Only compute relative path if file_path is within input directory
+                rel_path = Path(file_path).resolve().relative_to(input_base.resolve())
+                return rel_path.parent
+            except ValueError:
+                # If file isn't within input directory, just use filename
+                return Path('.')
+    
+    if output_dir:
+        if isinstance(output_dir, str) and is_s3_path(output_dir):
+            # Handle S3 output path
+            parsed = urlparse(output_dir)
+            bucket = parsed.netloc
+            prefix = parsed.path.lstrip('/')
+            if not prefix.endswith('/'):
+                prefix += '/'
+            
+            # Preserve directory structure relative to input path
+            rel_path = get_relative_path()
+            if rel_path != Path('.'):
+                prefix += f"{rel_path}/"
+                
+            return f"s3://{bucket}/{prefix}{file_stem}.{fmt}"
+        else:
+            # Handle local output path
+            rel_path = get_relative_path()
+            output_path = Path(output_dir)
+            if rel_path != Path('.'):
+                output_path = output_path / rel_path
+                
+            # Ensure the directory exists
+            output_path.mkdir(parents=True, exist_ok=True)
+            
+            return str(output_path / f"{file_stem}.{fmt}")
+    else:
+        # Store alongside input file
+        if isinstance(file_path, str) and is_s3_path(file_path):
+            # For S3 input, keep in same bucket/prefix
+            parsed = urlparse(file_path)
+            bucket = parsed.netloc
+            key = parsed.path.lstrip('/')
+            
+            # Use pathlib to handle the path components
+            key_path = Path(key)
+            dir_part = str(key_path.parent) if key_path.parent != Path('.') else ""
+            stem = file_path_obj.stem
+            new_key = f"{dir_part}/{stem}.{fmt}" if dir_part else f"{stem}.{fmt}"
+            return f"s3://{bucket}/{new_key}"
+        else:
+            # For local input, use same directory
+            return str(file_path_obj.with_suffix(f".{fmt}"))
 
 async def process_file(
     file_path: Union[str, Path],
     output_dir: Union[str, Path, None] = None,
     model: str = "whisper-1",
     formats: List[Literal["json", "txt", "srt"]] = ["json"],
-    input: str = ""  # Add input parameter to track original input path
+    input_base_path: str = ""
 ) -> None:
-    """Process a single file and save the transcription in all requested formats."""
+    """
+    Process a single file and save the transcription in all requested formats.
+    
+    Args:
+        file_path: Path to the audio file to process
+        output_dir: Directory to save outputs (if None, saves alongside input)
+        model: Whisper model to use for transcription
+        formats: Output formats to generate
+        input_base_path: Original input path for preserving directory structure
+    """
     try:
-        file_path_obj = Path(str(file_path))
-        
-        # Function to get the path for a specific format
-        def get_output_path(fmt: str) -> str:
-            # Get relative path for preserving directory structure
-            def get_relative_path():
-                if isinstance(file_path, str) and is_s3_path(file_path):
-                    parsed = urlparse(file_path)
-                    key = parsed.path.lstrip('/')
-                    input_path_obj = Path(key)
-                    # Get parent directories to preserve structure
-                    return input_path_obj.parent
-                else:
-                    # For local paths, get input directory
-                    input_base = Path(input)
-                    if input_base.is_file():
-                        input_base = input_base.parent
-                    # Get relative path from input base to file
-                    try:
-                        # Only compute relative path if file_path is within input directory
-                        rel_path = Path(file_path).resolve().relative_to(input_base.resolve())
-                        return rel_path.parent
-                    except ValueError:
-                        # If file isn't within input directory, just use filename
-                        return Path('.')
-            
-            if output_dir:
-                if isinstance(output_dir, str) and is_s3_path(output_dir):
-                    # Handle S3 output path
-                    parsed = urlparse(output_dir)
-                    bucket = parsed.netloc
-                    prefix = parsed.path.lstrip('/')
-                    if not prefix.endswith('/'):
-                        prefix += '/'
-                    
-                    # Preserve directory structure relative to input path
-                    rel_path = get_relative_path()
-                    if rel_path != Path('.'):
-                        prefix += f"{rel_path}/"
-                        
-                    return f"s3://{bucket}/{prefix}{file_path_obj.stem}.{fmt}"
-                else:
-                    # Handle local output path
-                    rel_path = get_relative_path()
-                    output_path = Path(output_dir)
-                    if rel_path != Path('.'):
-                        output_path = output_path / rel_path
-                        
-                    # Ensure the directory exists
-                    output_path.mkdir(parents=True, exist_ok=True)
-                    
-                    return str(output_path / f"{file_path_obj.stem}.{fmt}")
-            else:
-                # Store alongside input file
-                if isinstance(file_path, str) and is_s3_path(file_path):
-                    # For S3 input, keep in same bucket/prefix
-                    parsed = urlparse(file_path)
-                    bucket = parsed.netloc
-                    key = parsed.path.lstrip('/')
-                    
-                    # Use pathlib to handle the path components
-                    key_path = Path(key)
-                    dir_part = str(key_path.parent) if key_path.parent != Path('.') else ""
-                    stem = file_path_obj.stem
-                    new_key = f"{dir_part}/{stem}.{fmt}" if dir_part else f"{stem}.{fmt}"
-                    return f"s3://{bucket}/{new_key}"
-                else:
-                    # For local input, use same directory
-                    return str(file_path_obj.with_suffix(f".{fmt}"))
+        logger.info(f"Processing file: {file_path}")
         
         # Ensure json is always in the formats list
-        formats_to_process: List[Literal["json", "txt", "srt"]] = formats.copy()
+        formats_to_process = list(set(formats))  # Remove duplicates
         if "json" not in formats_to_process:
             formats_to_process.insert(0, "json")  # Add json as the first format
         
-        # Check if json output exists and can be reused
-        json_path = get_output_path("json")
+        # Get JSON output path and check if it exists
+        json_path = get_output_path(file_path, "json", output_dir, input_base_path)
         json_storage = get_storage_manager(json_path)
         json_exists = await json_storage.exists(json_path)
         
-        # Determine if we need to transcribe or can convert from existing JSON
-        result = None
+        # Initialize results and tasks
+        transcription_result = None
         save_tasks = []
         
-        # If JSON file exists and we don't need to retranscribe
-        if json_exists and "json" in formats and len(formats_to_process) > 1:
-            logger.info(f"Using existing JSON file {json_path} for format conversion")
-            # Read the existing JSON file
-            json_content = await json_storage.read_binary(json_path)
-            json_text = json_content.decode('utf-8')
+        # STEP 1: Try to use existing JSON if possible
+        if json_exists:
+            logger.info(f"Found existing JSON file: {json_path}")
+            # Load and parse the JSON file
             try:
-                # Parse the JSON content
-                result = json.loads(json_text)
-                # Only process the non-JSON formats since JSON already exists
-                for fmt in formats_to_process:
-                    if fmt != "json":  # Skip json since it already exists
-                        output_path = get_output_path(fmt)
-                        save_tasks.append(save_transcription(result, output_path, fmt))
+                json_content = await json_storage.read_binary(json_path)
+                json_text = json_content.decode('utf-8')
+                transcription_result = json.loads(json_text)
+                
+                # If only JSON was requested and it exists, we're done
+                if len(formats) == 1 and "json" in formats:
+                    logger.info(f"Skipping {file_path} as JSON already exists")
+                    return
             except json.JSONDecodeError as e:
-                logger.error(f"Error parsing existing JSON file {json_path}: {e}, retranscribing")
-                json_exists = False  # Treat as if JSON doesn't exist
+                logger.error(f"Error parsing existing JSON file {json_path}: {e}")
+                transcription_result = None  # Force re-transcription
         
-        # If no usable JSON file exists, transcribe and save all formats
-        if not json_exists or result is None:
-            # Transcribe the file
-            result = await transcribe_file(file_path, model)
+        # STEP 2: If no valid JSON exists, perform transcription
+        if not json_exists or transcription_result is None:
+            logger.info(f"Transcribing: {file_path}")
+            transcription_result = await transcribe_file(file_path, model)
             
-            # Save in all requested formats
-            for fmt in formats_to_process:
-                output_path = get_output_path(fmt)
-                save_tasks.append(save_transcription(result, output_path, fmt))
+            # Always save JSON result (used as cache for other formats)
+            save_tasks.append(save_transcription(
+                transcription_result, 
+                json_path, 
+                "json"
+            ))
         
-        # Run all save tasks concurrently
+        # STEP 3: Convert to other requested formats if needed
+        json_formatter = JsonFormat()
+        for fmt in formats:
+            if fmt != "json":  # Skip JSON as we've already handled it
+                output_path = get_output_path(file_path, fmt, output_dir, input_base_path)
+                
+                # Check if this format already exists
+                output_storage = get_storage_manager(output_path)
+                if not await output_storage.exists(output_path):
+                    logger.info(f"Converting to {fmt} format: {output_path}")
+                    save_tasks.append(save_transcription(
+                        transcription_result,
+                        output_path,
+                        fmt
+                    ))
+        
+        # Run all save tasks concurrently for better performance
         if save_tasks:
             await asyncio.gather(*save_tasks)
+            logger.info(f"Completed processing {file_path}")
+        else:
+            logger.info(f"No new formats to generate for {file_path}")
 
     except Exception as e:
         logger.error(f"Error processing {file_path}: {e}")
         raise
 
 
-async def should_process_file(
-    file_path: Union[str, Path],
-    output_dir: Optional[str],
-    formats: List[Literal["json", "txt", "srt"]],
-    input: str = ""  # Add input parameter to track original input path
-) -> bool:
-    """Check if a file needs to be processed by verifying if output files exist."""
-    file_path_obj = Path(str(file_path))
-    file_stem = file_path_obj.stem
+async def scan_output_files(output_dir: Optional[str], formats: List[str]) -> Dict[str, bool]:
+    """
+    Efficiently scan and cache all existing output files in the output directory.
     
-    # Ensure json is always in the formats list for checking
-    formats_to_check = formats.copy()
-    if "json" not in formats_to_check:
-        formats_to_check.insert(0, "json")  # Add json as the first format
-    
-    # Function to get the path for a specific format
-    def get_output_path(fmt: str) -> str:
-        # Get relative path for preserving directory structure
-        def get_relative_path():
-            if isinstance(file_path, str) and is_s3_path(file_path):
-                parsed = urlparse(file_path)
-                key = parsed.path.lstrip('/')
-                input_path_obj = Path(key)
-                # Get parent directories to preserve structure
-                return input_path_obj.parent
-            else:
-                # For local paths, get input directory
-                input_base = Path(input)
-                if input_base.is_file():
-                    input_base = input_base.parent
-                # Get relative path from input base to file
-                try:
-                    # Only compute relative path if file_path is within input directory
-                    rel_path = Path(file_path).resolve().relative_to(input_base.resolve())
-                    return rel_path.parent
-                except ValueError:
-                    # If file isn't within input directory, just use filename
-                    return Path('.')
+    Args:
+        output_dir: Directory to scan for existing outputs
+        formats: List of format extensions to look for
         
-        if output_dir:
-            if isinstance(output_dir, str) and is_s3_path(output_dir):
-                # Handle S3 output path
-                parsed = urlparse(output_dir)
-                bucket = parsed.netloc
-                prefix = parsed.path.lstrip('/')
-                if not prefix.endswith('/'):
-                    prefix += '/'
-                
-                # Preserve directory structure relative to input path
-                rel_path = get_relative_path()
-                if rel_path != Path('.'):
-                    prefix += f"{rel_path}/"
-                    
-                return f"s3://{bucket}/{prefix}{file_stem}.{fmt}"
-            else:
-                # Handle local output path
-                rel_path = get_relative_path()
-                output_path = Path(output_dir)
-                if rel_path != Path('.'):
-                    output_path = output_path / rel_path
-                    
-                # Ensure the directory exists
-                output_path.mkdir(parents=True, exist_ok=True)
-                
-                return str(output_path / f"{file_stem}.{fmt}")
-        else:
-            # Store alongside input file
-            if isinstance(file_path, str) and is_s3_path(file_path):
-                # For S3 input, keep in same bucket/prefix
-                parsed = urlparse(file_path)
-                bucket = parsed.netloc
-                key = parsed.path.lstrip('/')
-                
-                # Use pathlib to handle the path components
-                key_path = Path(key)
-                dir_part = str(key_path.parent) if key_path.parent != Path('.') else ""
-                stem = Path(file_stem).name
-                
-                new_key = f"{dir_part}/{stem}.{fmt}" if dir_part else f"{stem}.{fmt}"
-                return f"s3://{bucket}/{new_key}"
-            else:
-                # For local input, use same directory
-                return str(file_path_obj.with_suffix(f".{fmt}"))
-    
-    # First check if JSON file exists - if it doesn't, we need to process
-    json_path = get_output_path("json")
-    json_storage = get_storage_manager(json_path)
-    json_exists = await json_storage.exists(json_path)
-    
-    # If JSON doesn't exist, we need to process the file
-    if not json_exists:
-        return True
-    
-    # If only JSON was requested and it exists, we can skip
-    if len(formats) == 1 and "json" in formats:
-        logger.info(f"Skipping {file_path} as JSON output already exists")
-        return False
-    
-    # Check other formats - we can generate them from JSON if needed
-    need_processing = False
-    for fmt in formats:
-        if fmt != "json":  # Skip json since we already checked it
-            output_path = get_output_path(fmt)
-            storage = get_storage_manager(output_path)
-            if not await storage.exists(output_path):
-                # If any non-JSON format is missing, we need to process it
-                # but we don't need to re-transcribe since JSON exists
-                need_processing = True
-                break
-    
-    if not need_processing:
-        logger.info(f"Skipping {file_path} as all output files already exist")
-    
-    return need_processing
-
-async def get_existing_output_files(output_dir: Optional[str], formats: List[Literal["json", "txt", "srt"]]) -> Dict[str, bool]:
-    """Efficiently retrieve all existing output files to avoid individual file checks."""
+    Returns:
+        Dictionary mapping file paths to True for quick lookup
+    """
     existing_files: Dict[str, bool] = {}
     
     if not output_dir:
         # If no output directory is specified, we can't pre-cache the files
-        # This typically means outputs are alongside inputs, which makes bulk checking difficult
+        # This typically means outputs are alongside inputs, which is handled differently
         return existing_files
     
-    logger.info(f"Pre-caching existing output files in {output_dir}")
+    logger.info(f"Scanning existing output files in {output_dir}")
     progress = tqdm(desc="Scanning existing output files", unit="files", leave=True)
     
     storage = get_storage_manager(output_dir)
@@ -629,198 +659,144 @@ async def get_existing_output_files(output_dir: Optional[str], formats: List[Lit
     logger.info(f"Found {len(existing_files)} existing output files in {output_dir}")
     return existing_files
 
-async def should_process_file_with_cache(
+def check_file_needs_processing(
     file_path: Union[str, Path],
-    output_dir: Optional[str],
-    formats: List[Literal["json", "txt", "srt"]],
+    formats: List[str],
     existing_files_cache: Dict[str, bool],
-    input: str = ""
-) -> bool:
-    """Check if a file needs to be processed using the pre-cached file list."""
-    file_path_obj = Path(str(file_path))
-    file_stem = file_path_obj.stem
+    output_dir: Optional[Union[str, Path]],
+    input_base_path: str = ""
+) -> tuple[bool, set[str]]:
+    """
+    Check if a file needs to be processed based on existing output files.
     
-    # Ensure json is always in the formats list for checking
-    formats_to_check = formats.copy()
-    if "json" not in formats_to_check:
-        formats_to_check.insert(0, "json")  # Add json as the first format
+    Args:
+        file_path: Path to the audio file to check
+        formats: List of formats to generate
+        existing_files_cache: Cache of existing output files
+        output_dir: Output directory for generated files
+        input_base_path: Original input path for preserving structure
+        
+    Returns:
+        Tuple of (needs_processing, missing_formats) where:
+        - needs_processing: True if any format needs to be generated
+        - missing_formats: Set of formats that need to be generated
+    """
+    # If no cache (force mode), process everything
+    if not existing_files_cache:
+        return True, set(formats)
     
-    # Function to get the path for a specific format
-    def get_output_path(fmt: str) -> str:
-        # Get relative path for preserving directory structure
-        def get_relative_path():
-            if isinstance(file_path, str) and is_s3_path(file_path):
-                parsed = urlparse(file_path)
-                key = parsed.path.lstrip('/')
-                input_path_obj = Path(key)
-                # Get parent directories to preserve structure
-                return input_path_obj.parent
-            else:
-                # For local paths, get input directory
-                input_base = Path(input)
-                if input_base.is_file():
-                    input_base = input_base.parent
-                # Get relative path from input base to file
-                try:
-                    # Only compute relative path if file_path is within input directory
-                    rel_path = Path(file_path).resolve().relative_to(input_base.resolve())
-                    return rel_path.parent
-                except ValueError:
-                    # If file isn't within input directory, just use filename
-                    return Path('.')
-        
-        if output_dir:
-            if isinstance(output_dir, str) and is_s3_path(output_dir):
-                # Handle S3 output path
-                parsed = urlparse(output_dir)
-                bucket = parsed.netloc
-                prefix = parsed.path.lstrip('/')
-                if not prefix.endswith('/'):
-                    prefix += '/'
-                
-                # Preserve directory structure relative to input path
-                rel_path = get_relative_path()
-                if rel_path != Path('.'):
-                    prefix += f"{rel_path}/"
-                    
-                return f"s3://{bucket}/{prefix}{file_stem}.{fmt}"
-            else:
-                # Handle local output path
-                rel_path = get_relative_path()
-                output_path = Path(output_dir)
-                if rel_path != Path('.'):
-                    output_path = output_path / rel_path
-                    
-                # Ensure the directory exists
-                output_path.mkdir(parents=True, exist_ok=True)
-                
-                return str(output_path / f"{file_stem}.{fmt}")
-        else:
-            # Store alongside input file
-            if isinstance(file_path, str) and is_s3_path(file_path):
-                # For S3 input, keep in same bucket/prefix
-                parsed = urlparse(file_path)
-                bucket = parsed.netloc
-                key = parsed.path.lstrip('/')
-                
-                # Use pathlib to handle the path components
-                key_path = Path(key)
-                dir_part = str(key_path.parent) if key_path.parent != Path('.') else ""
-                stem = Path(file_stem).name
-                
-                new_key = f"{dir_part}/{stem}.{fmt}" if dir_part else f"{stem}.{fmt}"
-                return f"s3://{bucket}/{new_key}"
-            else:
-                # For local input, use same directory
-                return str(file_path_obj.with_suffix(f".{fmt}"))
+    # Ensure formats is a set for faster lookups
+    requested_formats = set(formats)
     
-    # Check if output directory is provided, use the cache for efficient checking
-    if output_dir and existing_files_cache:
-        # First check JSON format
-        json_path = get_output_path("json")
-        json_exists = json_path in existing_files_cache
-        
-        # If JSON doesn't exist, we need to process
-        if not json_exists:
-            return True
-        
-        # If only JSON was requested and it exists, skip
-        if len(formats) == 1 and formats[0] == "json":
-            logger.debug(f"Skipping {file_path} as JSON output already exists")
-            return False
-            
-        # Check other requested formats
-        need_processing = False
-        for fmt in formats:
-            if fmt != "json":  # Skip JSON as we already checked it
-                output_path = get_output_path(fmt)
-                if output_path not in existing_files_cache:
-                    need_processing = True
-                    break
-                    
-        if not need_processing:
-            logger.debug(f"Skipping {file_path} as all output files already exist")
-            
-        return need_processing
-    else:
-        # Fall back to individual file checking if no cache or no output directory
-        return await should_process_file(file_path, output_dir, formats, input)
+    # JSON is our primary format and cache for other formats
+    if "json" not in requested_formats:
+        requested_formats.add("json")
+    
+    # Check which formats are missing
+    missing_formats = set()
+    for fmt in requested_formats:
+        output_path = get_output_path(file_path, fmt, output_dir, input_base_path)
+        if output_path not in existing_files_cache:
+            missing_formats.add(fmt)
+    
+    # Determine if we need any processing at all
+    needs_processing = len(missing_formats) > 0
+    
+    # Special case: If JSON exists but other formats are missing,
+    # we only need to convert formats, not re-transcribe
+    if "json" not in missing_formats and len(missing_formats) > 0:
+        # Keep the missing non-JSON formats, but don't include JSON
+        # since we'll use the existing JSON for conversion
+        missing_formats.discard("json")
+    
+    return needs_processing, missing_formats
 
 async def process_files(
     files: List[str],
     output_dir: Optional[str] = None,
     concurrency: int = 5,
     model: str = "whisper-1",
-    formats: List[Literal["json", "txt", "srt"]] = ["json"],
+    formats: List[str] = ["json"],
     force: bool = False,
-    input: str = ""  # Add input parameter to track original input path
+    input_base_path: str = ""
 ) -> None:
-    """Process multiple files concurrently, skipping files that already have outputs unless force=True."""
-    # Ensure json is always in the formats list
-    if "json" not in formats:
-        formats.insert(0, "json")  # Add json as the first format
+    """
+    Process multiple files concurrently, skipping files that already have outputs unless force=True.
     
-    # If force is enabled, process all files
-    if force:
-        files_to_process = files
-        logger.info("Force flag enabled - processing all files regardless of existing outputs")
-    else:
-        # Pre-cache existing output files to avoid individual file checks
-        existing_files_cache = {}
-        if output_dir:
-            existing_files_cache = await get_existing_output_files(output_dir, formats)
-        
-        # Filter files that need processing
-        files_to_process = []
-        
-        # Set up progress bar for checking files
-        check_progress = tqdm(
-            total=len(files),
-            desc="Checking files to process",
-            position=0,
-            leave=True
+    Args:
+        files: List of audio file paths to process
+        output_dir: Directory to save output files
+        concurrency: Number of concurrent transcription jobs
+        model: Whisper model to use for transcription
+        formats: Output formats to generate
+        force: If True, process all files regardless of existing outputs
+        input_base_path: Original input path for preserving directory structure
+    """
+    # Validate formats against supported list
+    supported_formats = set(OutputFormat.FORMATS)
+    requested_formats = []
+    for fmt in formats:
+        if fmt in supported_formats:
+            requested_formats.append(fmt)
+        else:
+            logger.warning(f"Ignoring unsupported format: {fmt}")
+    
+    # If no valid formats specified, use JSON as default
+    if not requested_formats:
+        requested_formats = ["json"]
+    
+    # Step 1: Scan for existing output files if not in force mode
+    existing_files_cache = {}
+    if not force and output_dir:
+        existing_files_cache = await scan_output_files(output_dir, requested_formats)
+    
+    # Step 2: Determine which files need processing
+    files_to_process = []
+    processing_info = []  # Store (file_path, needs_processing, missing_formats)
+    
+    # Set up progress bar for checking files
+    check_progress = tqdm(
+        total=len(files),
+        desc="Checking files to process",
+        position=0,
+        leave=True
+    )
+    
+    # Check files in batches to avoid memory issues with large file lists
+    for file_path in files:
+        # Check if file needs processing and which formats are missing
+        needs_processing, missing_formats = check_file_needs_processing(
+            file_path, requested_formats, existing_files_cache, 
+            output_dir, input_base_path
         )
         
-        # Process files in batches to avoid memory issues with large file lists
-        batch_size = 1000
-        for i in range(0, len(files), batch_size):
-            batch = files[i:i+batch_size]
-            
-            # Check each file in the batch
-            needs_processing_tasks = []
-            for file_path in batch:
-                needs_processing_tasks.append(
-                    should_process_file_with_cache(
-                        file_path, output_dir, formats, existing_files_cache, input
-                    )
-                )
-            
-            # Wait for all checks in this batch to complete
-            needs_processing_results = await asyncio.gather(*needs_processing_tasks)
-            
-            # Filter files based on results
-            for file_path, needs_processing in zip(batch, needs_processing_results):
-                if needs_processing:
-                    files_to_process.append(file_path)
-                check_progress.update(1)
+        if needs_processing:
+            files_to_process.append(file_path)
+            processing_info.append((file_path, missing_formats))
         
-        # Close progress bar
-        check_progress.close()
+        check_progress.update(1)
     
+    # Close progress bar
+    check_progress.close()
+    
+    # If nothing to process, we're done
     if not files_to_process:
         logger.info("No files need processing - all output files already exist")
         return
         
-    logger.info(f"Processing {len(files_to_process)} of {len(files)} files (skipping {len(files) - len(files_to_process)} existing outputs)")
+    logger.info(f"Processing {len(files_to_process)} of {len(files)} files "
+               f"(skipping {len(files) - len(files_to_process)} with existing outputs)")
     
-    # Use a semaphore to limit concurrent API calls
+    # Step 3: Process files concurrently with semaphore to limit API calls
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def _process_with_semaphore(file_path):
+    async def _process_with_semaphore(file_path, missing_fmts):
         async with semaphore:
-            return await process_file(file_path, output_dir, model, formats, input)
+            # Only include formats that are missing or all if force mode
+            formats_to_use = list(missing_fmts) if missing_fmts else requested_formats
+            return await process_file(file_path, output_dir, model, formats_to_use, input_base_path)
 
-    # Set up progress bar
+    # Set up progress bar for processing
     progress = tqdm(
         total=len(files_to_process),
         desc="Transcribing files",
@@ -828,19 +804,18 @@ async def process_files(
         leave=True
     )
     
-    async def process_and_update(file_path):
+    async def process_and_update(file_info):
+        file_path, missing_formats = file_info
         try:
-            await _process_with_semaphore(file_path)
+            await _process_with_semaphore(file_path, missing_formats)
         except Exception as e:
             logger.error(f"Failed to process {file_path}: {e}")
-            # We're already using return_exceptions=True in gather, but we still 
-            # need to handle exceptions here to ensure progress bar updates
         finally:
             # Always update progress, even if file processing fails
             progress.update(1)
     
     # Create tasks for all files and process them concurrently
-    tasks = [process_and_update(file_path) for file_path in files_to_process]
+    tasks = [process_and_update(info) for info in processing_info]
     await asyncio.gather(*tasks, return_exceptions=True)
     progress.close()
 
@@ -863,7 +838,16 @@ def ensure_output_dir(output_dir: Optional[str]) -> None:
 
 
 async def collect_files(input_path: str, recursive: bool) -> List[str]:
-    """Collect audio files from any supported storage system."""
+    """
+    Collect audio files from any supported storage system.
+    
+    Args:
+        input_path: The input directory or file path (local or S3)
+        recursive: Whether to search subdirectories
+        
+    Returns:
+        List of audio file paths found
+    """
     # Use the appropriate storage manager
     storage = get_storage_manager(input_path)
     
@@ -989,8 +973,8 @@ def check_aws_credentials(uses_s3: bool) -> None:
 
 
 @click.command()
-@click.argument("input", required=True, type=str)
-@click.argument("output", required=True, type=str)
+@click.argument("input_path", required=True, type=str)
+@click.argument("output_path", required=True, type=str)
 @click.option(
     "--concurrency", "-c", default=5,
     help="Number of concurrent transcription requests"
@@ -1008,22 +992,23 @@ def check_aws_credentials(uses_s3: bool) -> None:
     help="Path to log file (default: logs/whisperbulk.log)"
 )
 @click.option(
-    "--model", "-m", default="Systran/faster-whisper-small",
+    "--model", "-m", default="whisper-1",
     help="Model to use for transcription"
 )
 @click.option(
-    "--format", "-f", default=["json"], multiple=True, type=click.Choice(["json", "txt", "srt"]),
-    help="Output format(s) for transcriptions (can be used multiple times, json is always included)"
+    "--format", "-f", default=["json"], multiple=True, 
+    type=click.Choice(OutputFormat.FORMATS),
+    help="Output format(s) for transcriptions (can be used multiple times)"
 )
 @click.option(
     "--force", is_flag=True,
     help="Force processing of all files, even if output files already exist"
 )
-def main(input, output, concurrency, recursive, verbose, log_file, model, format, force):
+def main(input_path, output_path, concurrency, recursive, verbose, log_file, model, format, force):
     """Bulk transcribe audio files using Whisper models.
 
-    INPUT is the source directory or file (or s3:// URI).
-    OUTPUT is the destination directory (or s3:// URI) for transcriptions.
+    INPUT_PATH is the source directory or file (or s3:// URI).
+    OUTPUT_PATH is the destination directory (or s3:// URI) for transcriptions.
 
     Supports local paths and S3 URIs (s3://bucket/path).
 
@@ -1031,15 +1016,15 @@ def main(input, output, concurrency, recursive, verbose, log_file, model, format
     don't already have corresponding output files for all requested formats.
     Use --force to process all files regardless of existing outputs.
 
-    The tool always generates JSON format output (containing full transcription data) 
-    and will use this as a cache for generating other formats. If you request 
+    The tool generates JSON format output (containing full transcription data) 
+    and uses this as a cache for generating other formats. If you request 
     multiple formats and the JSON file already exists, it will convert from that
     instead of re-transcribing the audio file.
 
     Example usage:
 
         whisperbulk ./audio_files ./transcriptions -c 10 -r
-        whisperbulk s3://mybucket/audio s3://mybucket/transcriptions -m openai/whisper-1 -f srt
+        whisperbulk s3://mybucket/audio s3://mybucket/transcriptions -m whisper-1 -f srt
         
     You can specify multiple output formats:
     
@@ -1073,18 +1058,18 @@ def main(input, output, concurrency, recursive, verbose, log_file, model, format
     # Validate inputs and environment
     check_requirements()
 
-    input_uses_s3 = is_s3_path(input)
-    output_uses_s3 = is_s3_path(output)
+    input_uses_s3 = is_s3_path(input_path)
+    output_uses_s3 = is_s3_path(output_path)
     check_aws_credentials(input_uses_s3 or output_uses_s3)
 
     # Ensure local output directory exists
-    if output and not is_s3_path(output):
-        Path(output).mkdir(parents=True, exist_ok=True)
+    if output_path and not is_s3_path(output_path):
+        Path(output_path).mkdir(parents=True, exist_ok=True)
 
     # Use asyncio to run the entire pipeline
     async def run_pipeline():
         # Collect files to process
-        files_to_process = await collect_files(input, recursive)
+        files_to_process = await collect_files(input_path, recursive)
         
         if not files_to_process:
             logger.error("No audio files found to process")
@@ -1102,16 +1087,20 @@ def main(input, output, concurrency, recursive, verbose, log_file, model, format
         if not formats_list:
             formats_list = ["json"]
             
-        # Ensure json is always included
-        if "json" not in formats_list:
-            formats_list.insert(0, "json")  # Add json as the first format
-            
         # Log resumable mode (unless force is enabled)
         if not force:
             logger.info("Running in resumable mode - will skip files that already have outputs")
             
         # Process the files
-        await process_files(files_to_process, output, concurrency, model, formats_list, force, input)
+        await process_files(
+            files_to_process, 
+            output_path, 
+            concurrency, 
+            model, 
+            formats_list, 
+            force, 
+            input_path
+        )
         
         logger.info(f"All files processed successfully in format(s): {', '.join(formats_list)}")
     
