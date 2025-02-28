@@ -3,7 +3,6 @@
 WhisperBulk: A CLI tool for bulk transcribing audio files using
 various Whisper model implementations.
 """
-import os
 import sys
 import asyncio
 import logging
@@ -12,9 +11,7 @@ import tempfile
 import aiofiles
 import srt
 import datetime
-from pathlib import Path
 from typing import List, Optional, Union, Any, Dict, Literal, Set
-from urllib.parse import urlparse
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 
@@ -23,6 +20,7 @@ import dotenv
 from openai import AsyncOpenAI
 import tenacity
 from tqdm import tqdm
+from cloudpathlib import AnyPath, CloudPath
 
 # Constants
 AUDIO_EXTENSIONS = (".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm")
@@ -32,42 +30,43 @@ DERIVATIVE_FORMATS = ["txt", "srt"]
 dotenv.load_dotenv()
 
 # Setup logging
-log_dir = Path(__file__).parent / "logs"
+log_dir = AnyPath(__file__).parent / "logs"
 log_dir.mkdir(exist_ok=True)
 log_file = log_dir / "whisperbulk.log"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    filename=log_file,
+    filename=str(log_file),
     filemode='a'
 )
 logger = logging.getLogger("whisperbulk")
 
-openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# Initialize OpenAI client with API key from environment
+openai_client = AsyncOpenAI()
 
 
 class StorageManager(ABC):
     """Abstract base class for storage operations."""
     
     @abstractmethod
-    async def exists(self, path: Union[str, Path]) -> bool:
+    async def exists(self, path: AnyPath) -> bool:
         """Check if a file exists."""
         pass
     
     @abstractmethod
-    async def read_binary(self, path: Union[str, Path]) -> bytes:
+    async def read_binary(self, path: AnyPath) -> bytes:
         """Read a file as binary data."""
         pass
     
     @abstractmethod
-    async def write_text(self, path: Union[str, Path], content: str) -> None:
+    async def write_text(self, path: AnyPath, content: str) -> None:
         """Write string content to a file."""
         pass
     
     @abstractmethod
-    async def list_files(self, path: Union[str, Path], 
-                         recursive: bool, pattern: Optional[str] = None) -> List[str]:
+    async def list_files(self, path: AnyPath, 
+                         recursive: bool, pattern: Optional[str] = None) -> List[AnyPath]:
         """List files in a directory matching the pattern."""
         pass
 
@@ -75,32 +74,29 @@ class StorageManager(ABC):
 class LocalStorageManager(StorageManager):
     """Manages local file operations using asyncio."""
     
-    async def exists(self, path: Union[str, Path]) -> bool:
+    async def exists(self, path: AnyPath) -> bool:
         """Check if a local file exists."""
-        return Path(str(path)).exists()
+        return path.exists()
     
-    async def read_binary(self, path: Union[str, Path]) -> bytes:
+    async def read_binary(self, path: AnyPath) -> bytes:
         """Read a local file as binary data."""
         async with aiofiles.open(str(path), 'rb') as f:
             return await f.read()
     
-    async def write_text(self, path: Union[str, Path], content: str) -> None:
+    async def write_text(self, path: AnyPath, content: str) -> None:
         """Write string content to a local file."""
         # Ensure directory exists
-        file_path = Path(str(path))
-        file_path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         
         # Write content
-        async with aiofiles.open(str(file_path), 'w', encoding='utf-8') as f:
+        async with aiofiles.open(str(path), 'w', encoding='utf-8') as f:
             await f.write(content)
     
-    async def list_files(self, path: Union[str, Path], 
-                         recursive: bool, pattern: Optional[str] = None) -> List[str]:
+    async def list_files(self, path: AnyPath, 
+                         recursive: bool, pattern: Optional[str] = None) -> List[AnyPath]:
         """List local files matching the pattern."""
-        path_obj = Path(str(path))
-        
-        if path_obj.is_file():
-            return [str(path_obj)]
+        if path.is_file():
+            return [path]
         
         files = []
         
@@ -112,125 +108,74 @@ class LocalStorageManager(StorageManager):
             # Use audio extensions for filtering
             patterns = [f"*{ext}" for ext in AUDIO_EXTENSIONS]
         
-        # Use pathlib glob or rglob based on recursive flag
         for pattern in patterns:
+            # Use glob or rglob based on recursive flag
             if recursive:
-                # Use ** for recursive search with pathlib
-                if path_obj.is_dir():
+                # Use ** for recursive search
+                if path.is_dir():
                     glob_pattern = f"**/{pattern}"
-                    files.extend([str(p) for p in path_obj.glob(glob_pattern)])
+                    files.extend(list(path.glob(glob_pattern)))
             else:
                 # Non-recursive glob
-                files.extend([str(p) for p in path_obj.glob(pattern)])
+                files.extend(list(path.glob(pattern)))
         
         return files
 
 
-class S3StorageManager(StorageManager):
-    """Manages S3 operations using aiobotocore."""
+class CloudStorageManager(StorageManager):
+    """Manages cloud operations using cloudpathlib."""
     
-    def __init__(self):
-        """Initialize the S3 storage manager."""
-        # Lazy import to avoid dependency issues
-        import aiobotocore.session
-        self.session = aiobotocore.session.get_session()
+    async def exists(self, path: AnyPath) -> bool:
+        """Check if a file exists in cloud storage."""
+        return path.exists()
     
-    @asynccontextmanager
-    async def _get_client(self):
-        """Create and yield an S3 client using aiobotocore."""
-        async with self.session.create_client('s3') as client:
-            yield client
+    async def read_binary(self, path: AnyPath) -> bytes:
+        """Read a file from cloud storage as binary data."""
+        with path.open('rb') as f:
+            return f.read()
     
-    async def exists(self, path: Union[str, Path]) -> bool:
-        """Check if a file exists in S3."""
-        parsed = urlparse(str(path))
-        bucket = parsed.netloc
-        key = parsed.path.lstrip('/')
-        
-        try:
-            async with self._get_client() as client:
-                await client.head_object(Bucket=bucket, Key=key)
-                return True
-        except Exception:
-            return False
+    async def write_text(self, path: AnyPath, content: str) -> None:
+        """Write string content to a cloud file."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
     
-    async def read_binary(self, path: Union[str, Path]) -> bytes:
-        """Read a file from S3 as binary data."""
-        parsed = urlparse(str(path))
-        bucket = parsed.netloc
-        key = parsed.path.lstrip('/')
-        
-        async with self._get_client() as client:
-            response = await client.get_object(Bucket=bucket, Key=key)
-            async with response['Body'] as stream:
-                return await stream.read()
-    
-    async def write_text(self, path: Union[str, Path], content: str) -> None:
-        """Write string content to an S3 file."""
-        parsed = urlparse(str(path))
-        bucket = parsed.netloc
-        key = parsed.path.lstrip('/')
-        
-        async with self._get_client() as client:
-            await client.put_object(
-                Bucket=bucket,
-                Key=key,
-                Body=content.encode('utf-8'),
-                ContentType='text/plain'
-            )
-    
-    async def list_files(self, path: Union[str, Path], 
-                          recursive: bool, pattern: Optional[str] = None) -> List[str]:
-        """List files in an S3 bucket/prefix."""
-        parsed = urlparse(str(path))
-        bucket = parsed.netloc
-        prefix = parsed.path.lstrip('/')
-        
-        if not recursive and prefix and not prefix.endswith('/'):
-            # If not recursive, we only want objects in this "directory"
-            prefix = f"{prefix}/"
+    async def list_files(self, path: AnyPath, 
+                        recursive: bool, pattern: Optional[str] = None) -> List[AnyPath]:
+        """List files in cloud storage using cloudpathlib."""
+        if path.is_file():
+            return [path]
         
         files = []
-        async with self._get_client() as client:
-            paginator = client.get_paginator('list_objects_v2')
-            
-            async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-                if 'Contents' in page:
-                    # Filter results based on pattern or audio extensions
-                    for obj in page['Contents']:
-                        key = obj['Key']
-                        
-                        # Skip "directory" objects
-                        if key.endswith('/'):
-                            continue
-                        
-                        # If pattern is None, filter by audio extensions
-                        if pattern is None and not any(key.lower().endswith(ext) for ext in AUDIO_EXTENSIONS):
-                            continue
-                            
-                        # If pattern is provided, do basic matching
-                        if pattern and not self._matches_pattern(key, pattern):
-                            continue
-                            
-                        files.append(f"s3://{bucket}/{key}")
+        
+        # Handle pattern or use default audio extensions
+        patterns = []
+        if pattern:
+            patterns = [pattern]
+        else:
+            # Use audio extensions for filtering
+            patterns = [f"*{ext}" for ext in AUDIO_EXTENSIONS]
+        
+        for pattern in patterns:
+            # Use glob or rglob based on recursive flag
+            if recursive:
+                # Use ** for recursive search
+                if path.is_dir():
+                    glob_pattern = f"**/{pattern}"
+                    files.extend(list(path.glob(glob_pattern)))
+            else:
+                # Non-recursive glob
+                files.extend(list(path.glob(pattern)))
+        
+        # Filter out directories from results
+        files = [f for f in files if not f.is_dir()]
         
         return files
-    
-    def _matches_pattern(self, key: str, pattern: str) -> bool:
-        """Basic pattern matching for S3 keys."""
-        import fnmatch
-        filename = key.split('/')[-1]
-        return fnmatch.fnmatch(filename, pattern)
 
 
-def get_storage_manager(path: Union[str, Path]) -> StorageManager:
+def get_storage_manager(path: AnyPath) -> StorageManager:
     """Factory function to get the appropriate storage manager."""
-    if isinstance(path, str) and is_s3_path(path):
-        try:
-            return S3StorageManager()
-        except ImportError:
-            logger.error("aiobotocore is required for S3 operations. Install with 'pip install aiobotocore'")
-            sys.exit(1)
+    if isinstance(path, CloudPath):
+        return CloudStorageManager()
     else:
         return LocalStorageManager()
 
@@ -244,44 +189,34 @@ def get_storage_manager(path: Union[str, Path]) -> StorageManager:
         f"{retry_state.outcome.exception() if retry_state.outcome else 'Unknown error'}"
     ),
 )
-async def transcribe_file(file_path: Union[str, Path], model: str) -> Dict:
+async def transcribe_file(file_path: AnyPath, model: str) -> Dict:
     """Transcribe a single audio file using the specified Whisper model with retry logic."""
     logger.info(f"Transcribing {file_path} with model {model}")
     
-    # For S3 files or other remote files, we need to download them first
-    if isinstance(file_path, str) and is_s3_path(file_path):
-        # Use the storage manager to read the file
-        storage = get_storage_manager(file_path)
-        file_data = await storage.read_binary(file_path)
+    # Read the file data
+    storage = get_storage_manager(file_path)
+    file_data = await storage.read_binary(file_path)
+    
+    # Create a temporary file
+    file_name = file_path.name
+    temp_file_path = AnyPath(tempfile.NamedTemporaryFile(suffix=file_name, delete=False).name)
+    
+    try:
+        # Write the file data to the temporary file
+        temp_file_path.write_bytes(file_data)
         
-        # Create a temporary file
-        file_name = Path(str(file_path)).name
-        with tempfile.NamedTemporaryFile(suffix=file_name, delete=False) as temp_file:
-            temp_file.write(file_data)
-            temp_file_path = Path(temp_file.name)
-        
-        try:
-            # Use the local file path for transcription
-            with open(temp_file_path, "rb") as file_obj:
-                response = await openai_client.audio.transcriptions.create(
-                    file=file_obj, 
-                    model=model,
-                    response_format="verbose_json"
-                )
-            return response.model_dump() if hasattr(response, "model_dump") else response
-        finally:
-            # Clean up the temporary file
-            if temp_file_path.exists():
-                temp_file_path.unlink()
-    else:
-        # For local files, we can use them directly
-        with open(str(file_path), "rb") as file_obj:
+        # Use the temporary file for transcription
+        with temp_file_path.open("rb") as file_obj:
             response = await openai_client.audio.transcriptions.create(
-                file=file_obj,
+                file=file_obj, 
                 model=model,
                 response_format="verbose_json"
             )
         return response.model_dump() if hasattr(response, "model_dump") else response
+    finally:
+        # Clean up the temporary file
+        if temp_file_path.exists():
+            temp_file_path.unlink()
 
 
 class DerivativeConverter:
@@ -329,7 +264,7 @@ class DerivativeConverter:
 
 async def save_json_transcription(
     transcription_data: Dict,
-    output_path: Union[str, Path]
+    output_path: AnyPath
 ) -> None:
     """Save transcription results as JSON."""
     # Format as JSON string
@@ -344,7 +279,7 @@ async def save_json_transcription(
 
 async def save_derivative(
     transcription_data: Dict,
-    output_path: Union[str, Path],
+    output_path: AnyPath,
     format_name: Literal["txt", "srt"]
 ) -> None:
     """Save transcription results in a derivative format (txt or srt)."""
@@ -364,11 +299,11 @@ async def save_derivative(
 
 
 def get_output_path(
-    file_path: Union[str, Path],
+    file_path: AnyPath,
     fmt: str,
-    output_dir: Optional[Union[str, Path]] = None,
-    input_base_path: str = ""
-) -> str:
+    output_dir: Optional[AnyPath] = None,
+    input_base_path: AnyPath = None
+) -> AnyPath:
     """
     Generate the output path for a given file and format, preserving directory structure.
     
@@ -381,82 +316,61 @@ def get_output_path(
     Returns:
         The full output path for the given format
     """
-    file_path_obj = Path(str(file_path))
-    file_stem = file_path_obj.stem
+    file_stem = file_path.stem
     
     # Get relative path for preserving directory structure
-    def get_relative_path():
-        if isinstance(file_path, str) and is_s3_path(file_path):
-            parsed = urlparse(file_path)
-            key = parsed.path.lstrip('/')
-            input_path_obj = Path(key)
-            # Get parent directories to preserve structure
-            return input_path_obj.parent
-        else:
-            # For local paths, get input directory
-            input_base = Path(input_base_path)
-            if input_base.is_file():
-                input_base = input_base.parent
-            # Get relative path from input base to file
-            try:
-                # Only compute relative path if file_path is within input directory
-                rel_path = Path(file_path).resolve().relative_to(input_base.resolve())
-                return rel_path.parent
-            except ValueError:
-                # If file isn't within input directory, just use filename
-                return Path('.')
+    def get_relative_path() -> AnyPath:
+        # Default to current directory if input_base_path is None
+        if input_base_path is None:
+            return AnyPath(".")
+            
+        input_base = input_base_path
+        if input_base.is_file():
+            input_base = input_base.parent
+            
+        # Get relative path from input base to file
+        try:
+            # Convert both to string representations
+            file_str = str(file_path)
+            base_str = str(input_base)
+            
+            # Check if file path starts with the base path
+            if file_str.startswith(base_str):
+                # Extract the relative part
+                rel_part = file_str[len(base_str):].lstrip('/')
+                return AnyPath(rel_part).parent
+                
+            return AnyPath(".")
+        except Exception:
+            # If path computation fails, just use filename
+            return AnyPath(".")
     
     if output_dir:
-        if isinstance(output_dir, str) and is_s3_path(output_dir):
-            # Handle S3 output path
-            parsed = urlparse(output_dir)
-            bucket = parsed.netloc
-            prefix = parsed.path.lstrip('/')
-            if not prefix.endswith('/'):
-                prefix += '/'
-            
-            # Preserve directory structure relative to input path
-            rel_path = get_relative_path()
-            if rel_path != Path('.'):
-                prefix += f"{rel_path}/"
-                
-            return f"s3://{bucket}/{prefix}{file_stem}.{fmt}"
+        # Preserve directory structure relative to input path
+        rel_path = get_relative_path()
+        
+        if str(rel_path) == ".":
+            # Just output to the root of output_dir
+            output_path = output_dir / f"{file_stem}.{fmt}"
         else:
-            # Handle local output path
-            rel_path = get_relative_path()
-            output_path = Path(output_dir)
-            if rel_path != Path('.'):
-                output_path = output_path / rel_path
-                
-            # Ensure the directory exists
-            output_path.mkdir(parents=True, exist_ok=True)
-            
-            return str(output_path / f"{file_stem}.{fmt}")
+            # Add relative path components to preserve structure
+            output_path = output_dir / rel_path / f"{file_stem}.{fmt}"
+        
+        # Ensure the directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        return output_path
     else:
         # Store alongside input file
-        if isinstance(file_path, str) and is_s3_path(file_path):
-            # For S3 input, keep in same bucket/prefix
-            parsed = urlparse(file_path)
-            bucket = parsed.netloc
-            key = parsed.path.lstrip('/')
-            
-            # Use pathlib to handle the path components
-            key_path = Path(key)
-            dir_part = str(key_path.parent) if key_path.parent != Path('.') else ""
-            stem = file_path_obj.stem
-            new_key = f"{dir_part}/{stem}.{fmt}" if dir_part else f"{stem}.{fmt}"
-            return f"s3://{bucket}/{new_key}"
-        else:
-            # For local input, use same directory
-            return str(file_path_obj.with_suffix(f".{fmt}"))
+        return file_path.with_suffix(f".{fmt}")
 
 
 async def process_file(
-    file_path: Union[str, Path],
-    output_dir: Union[str, Path, None] = None,
+    file_path: AnyPath,
+    output_dir: Optional[AnyPath] = None,
     model: str = "whisper-1",
     derivatives: Optional[List[Literal["txt", "srt"]]] = None,
-    input_base_path: str = ""
+    input_base_path: AnyPath = None
 ) -> None:
     """
     Process a single file: transcribe to JSON and optionally create derivative formats.
@@ -532,7 +446,7 @@ async def process_file(
         raise
 
 
-async def scan_output_files(output_dir: Optional[str], formats: List[str]) -> Dict[str, bool]:
+async def scan_output_files(output_dir: AnyPath, formats: List[str]) -> Dict[str, bool]:
     """
     Efficiently scan and cache all existing output files in the output directory.
     
@@ -545,9 +459,8 @@ async def scan_output_files(output_dir: Optional[str], formats: List[str]) -> Di
     """
     existing_files: Dict[str, bool] = {}
     
-    if not output_dir:
+    if output_dir is None:
         # If no output directory is specified, we can't pre-cache the files
-        # This typically means outputs are alongside inputs, which is handled differently
         return existing_files
     
     logger.info(f"Scanning existing output files in {output_dir}")
@@ -561,7 +474,7 @@ async def scan_output_files(output_dir: Optional[str], formats: List[str]) -> Di
         try:
             files = await storage.list_files(output_dir, recursive=True, pattern=pattern)
             for file_path in files:
-                existing_files[file_path] = True
+                existing_files[str(file_path)] = True
                 progress.update(1)
         except Exception as e:
             logger.warning(f"Error listing existing {fmt} files in {output_dir}: {e}")
@@ -572,11 +485,11 @@ async def scan_output_files(output_dir: Optional[str], formats: List[str]) -> Di
 
 
 def check_file_needs_processing(
-    file_path: Union[str, Path],
+    file_path: AnyPath,
     derivatives: Optional[List[str]],
     existing_files_cache: Dict[str, bool],
-    output_dir: Optional[Union[str, Path]],
-    input_base_path: str = ""
+    output_dir: Optional[AnyPath],
+    input_base_path: AnyPath = None
 ) -> tuple[bool, bool, Set[str]]:
     """
     Check if a file needs transcription and/or derivative creation.
@@ -600,14 +513,14 @@ def check_file_needs_processing(
     
     # Get path to JSON transcription
     json_path = get_output_path(file_path, "json", output_dir, input_base_path)
-    needs_transcription = json_path not in existing_files_cache
+    needs_transcription = str(json_path) not in existing_files_cache
     
     # Check which derivatives are missing
     missing_derivatives = set()
     if derivatives:
         for fmt in derivatives:
             output_path = get_output_path(file_path, fmt, output_dir, input_base_path)
-            if output_path not in existing_files_cache:
+            if str(output_path) not in existing_files_cache:
                 missing_derivatives.add(fmt)
     
     needs_derivatives = len(missing_derivatives) > 0
@@ -616,13 +529,13 @@ def check_file_needs_processing(
 
 
 async def process_files(
-    files: List[str],
-    output_dir: Optional[str] = None,
+    files: List[AnyPath],
+    output_dir: Optional[AnyPath] = None,
     concurrency: int = 5,
     model: str = "whisper-1",
     derivatives: Optional[List[Literal["txt", "srt"]]] = None,
     force: bool = False,
-    input_base_path: str = ""
+    input_base_path: AnyPath = None
 ) -> None:
     """
     Process multiple files concurrently, skipping files that already have outputs unless force=True.
@@ -640,7 +553,7 @@ async def process_files(
     validated_derivatives = derivatives or []
     
     # Validate derivatives against supported list
-    for fmt in validated_derivatives:
+    for fmt in validated_derivatives.copy():
         if fmt not in DERIVATIVE_FORMATS:
             logger.warning(f"Ignoring unsupported derivative format: {fmt}")
             validated_derivatives.remove(fmt)
@@ -663,7 +576,7 @@ async def process_files(
         leave=True
     )
     
-    # Check files in batches to avoid memory issues with large file lists
+    # Check files to determine what needs processing
     for file_path in files:
         # Check if file needs processing and which formats are missing
         needs_transcription, needs_derivatives, missing_derivatives = check_file_needs_processing(
@@ -730,156 +643,80 @@ async def process_files(
     progress.close()
 
 
-def is_audio_file(filename: str) -> bool:
+def is_audio_file(path: AnyPath) -> bool:
     """Check if a file is a supported audio format."""
-    return filename.lower().endswith(AUDIO_EXTENSIONS)
+    return path.suffix.lower() in AUDIO_EXTENSIONS
 
 
-def is_s3_path(path: str) -> bool:
-    """Check if a path is an S3 URI."""
-    parsed = urlparse(path)
-    return parsed.scheme == "s3"
-
-
-def ensure_output_dir(output_dir: Optional[str]) -> None:
-    """Ensure the output directory exists if it's a local path."""
-    if output_dir and not is_s3_path(output_dir):
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-
-async def collect_files(input_path: str, recursive: bool) -> List[str]:
+async def collect_files(input_path: AnyPath, recursive: bool) -> List[AnyPath]:
     """
-    Collect audio files from any supported storage system.
+    Collect audio files using AnyPath.
     
     Args:
-        input_path: The input directory or file path (local or S3)
+        input_path: The input directory or file path
         recursive: Whether to search subdirectories
         
     Returns:
         List of audio file paths found
     """
-    # Use the appropriate storage manager
-    storage = get_storage_manager(input_path)
-    
     try:
-        # For S3 storage, we need to use pagination which naturally gives us incremental updates
-        if isinstance(storage, S3StorageManager):
-            s3_files: List[str] = []
-            parsed = urlparse(input_path)
-            bucket = parsed.netloc
-            prefix = parsed.path.lstrip('/')
-            
-            if not recursive and prefix and not prefix.endswith('/'):
-                # If not recursive, we only want objects in this "directory"
-                prefix = f"{prefix}/"
-            
-            print(f"Searching for audio files in s3://{bucket}/{prefix}...")
-            
-            # Create progress bar without a total (unknown at start)
-            progress = tqdm(
-                desc="Discovering audio files",
-                unit="files",
-                leave=True
-            )
-            
-            async with storage._get_client() as client:
-                paginator = client.get_paginator('list_objects_v2')
-                
-                async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-                    if 'Contents' in page:
-                        # Filter results based on audio extensions
-                        for obj in page['Contents']:
-                            key = obj['Key']
-                            
-                            # Skip "directory" objects
-                            if key.endswith('/'):
-                                continue
-                            
-                            # Filter by audio extensions
-                            if any(key.lower().endswith(ext) for ext in AUDIO_EXTENSIONS):
-                                s3_files.append(f"s3://{bucket}/{key}")
-                                progress.update(1)
-            
-            # Close the progress bar
-            progress.close()
-            
-            if not s3_files:
-                print("No audio files found.")
-                
-            return s3_files
-                
-        else:  # LocalStorageManager
-            path_obj = Path(str(input_path))
-            
-            # If it's a single file, just check if it's audio and return
-            if path_obj.is_file():
-                if is_audio_file(str(path_obj)):
-                    return [str(path_obj)]
-                else:
-                    return []
-            
-            print(f"Searching for audio files in {input_path}...")
-            local_files: List[str] = []
-            
-            # Create a list of patterns for audio files
-            patterns = [f"*{ext}" for ext in AUDIO_EXTENSIONS]
-            
-            # Create progress bar without a total (unknown at start)
-            progress = tqdm(
-                desc="Discovering audio files",
-                unit="files",
-                leave=True
-            )
-            
-            # Process directory
-            if recursive:
-                for pattern in patterns:
-                    # Use ** for recursive search with pathlib
-                    glob_pattern = f"**/{pattern}"
-                    for file_path in path_obj.glob(glob_pattern):
-                        if file_path.is_file():  # Ensure it's a file
-                            local_files.append(str(file_path))
-                            progress.update(1)
+        print(f"Searching for audio files in {input_path}...")
+        
+        # Create progress bar without a total (unknown at start)
+        progress = tqdm(
+            desc="Discovering audio files",
+            unit="files",
+            leave=True
+        )
+        
+        # If it's a single file, just check if it's audio and return
+        if input_path.is_file():
+            if is_audio_file(input_path):
+                progress.update(1)
+                progress.close()
+                return [input_path]
             else:
-                for pattern in patterns:
-                    for file_path in path_obj.glob(pattern):
-                        if file_path.is_file():  # Ensure it's a file
-                            local_files.append(str(file_path))
-                            progress.update(1)
-            
-            # Close the progress bar
-            progress.close()
-            
-            if not local_files and path_obj.is_dir():
-                print("No audio files found.")
-                logger.warning(
-                    f"{input_path} is a directory with no audio files. "
-                    f"Use --recursive to process subdirectories if needed."
-                )
-            
-            logger.info(f"Found {len(local_files)} audio files to process")
-            return local_files
+                progress.close()
+                return []
+                
+        # For directories, use globbing with AnyPath
+        audio_files = []
+        
+        # Create a list of patterns for audio files
+        patterns = [f"*{ext}" for ext in AUDIO_EXTENSIONS]
+        
+        # Process directory
+        for pattern in patterns:
+            if recursive:
+                # Use ** for recursive search
+                glob_pattern = f"**/{pattern}"
+                for file_path in input_path.glob(glob_pattern):
+                    if not file_path.is_dir():  # Ensure it's a file
+                        audio_files.append(file_path)
+                        progress.update(1)
+            else:
+                for file_path in input_path.glob(pattern):
+                    if not file_path.is_dir():  # Ensure it's a file
+                        audio_files.append(file_path)
+                        progress.update(1)
+        
+        # Close the progress bar
+        progress.close()
+        
+        if not audio_files and input_path.is_dir():
+            print("No audio files found.")
+            logger.warning(
+                f"{input_path} is a directory with no audio files. "
+                f"Use --recursive to process subdirectories if needed."
+            )
+        
+        logger.info(f"Found {len(audio_files)} audio files to process")
+        return audio_files
         
     except Exception as e:
         logger.error(f"Error collecting files from {input_path}: {e}")
         print(f"Error searching for files: {e}")
         sys.exit(1)
-
-
-def check_requirements() -> None:
-    """Check required environment variables."""
-    if not os.environ.get("OPENAI_API_KEY"):
-        logger.error("OPENAI_API_KEY environment variable not set")
-        sys.exit(1)
-
-
-def check_aws_credentials(uses_s3: bool) -> None:
-    """Warn if AWS credentials are missing when using S3."""
-    if uses_s3 and not (
-        os.environ.get("AWS_ACCESS_KEY_ID") and
-        os.environ.get("AWS_SECRET_ACCESS_KEY")
-    ):
-        logger.warning("AWS credentials not found in environment variables")
 
 
 @click.command()
@@ -942,11 +779,15 @@ def main(input_path, output_path, concurrency, recursive, verbose, log_file, mod
     
         whisperbulk ./audio_files ./transcriptions --force
     """
+    # Convert input and output paths to AnyPath objects
+    input_path_obj = AnyPath(input_path)
+    output_path_obj = AnyPath(output_path) if output_path else None
+    
     # Configure logging
     if log_file:
         # If user provided custom log file path
-        log_path = Path(log_file)
-        if log_path.parent != Path('.'):
+        log_path = AnyPath(log_file)
+        if log_path.parent != AnyPath('.'):
             log_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Reconfigure the logging to use the custom file
@@ -956,28 +797,21 @@ def main(input_path, output_path, concurrency, recursive, verbose, log_file, mod
         logging.basicConfig(
             level=logging.DEBUG if verbose else logging.INFO,
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            filename=log_path,
+            filename=str(log_path),
             filemode='a'
         )
     elif verbose:
         # Just change the log level if using default log file
         logger.setLevel(logging.DEBUG)
 
-    # Validate inputs and environment
-    check_requirements()
-
-    input_uses_s3 = is_s3_path(input_path)
-    output_uses_s3 = is_s3_path(output_path)
-    check_aws_credentials(input_uses_s3 or output_uses_s3)
-
-    # Ensure local output directory exists
-    if output_path and not is_s3_path(output_path):
-        Path(output_path).mkdir(parents=True, exist_ok=True)
+    # Ensure output directory exists if it's local
+    if output_path_obj:
+        output_path_obj.parent.mkdir(parents=True, exist_ok=True)
 
     # Use asyncio to run the entire pipeline
     async def run_pipeline():
         # Collect files to process
-        files_to_process = await collect_files(input_path, recursive)
+        files_to_process = await collect_files(input_path_obj, recursive)
         
         if not files_to_process:
             logger.error("No audio files found to process")
@@ -998,12 +832,12 @@ def main(input_path, output_path, concurrency, recursive, verbose, log_file, mod
         # Process the files
         await process_files(
             files_to_process, 
-            output_path, 
+            output_path_obj, 
             concurrency, 
             model, 
             derivatives_list, 
             force, 
-            input_path
+            input_path_obj
         )
         
         # Log completion message with appropriate format information
