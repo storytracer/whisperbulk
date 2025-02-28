@@ -301,7 +301,8 @@ async def save_derivative(
 def get_output_path(
     file_path: AnyPath,
     fmt: str,
-    output_dir: Optional[AnyPath] = None
+    output_dir: Optional[AnyPath] = None,
+    input_dir: Optional[AnyPath] = None
 ) -> AnyPath:
     """
     Generate the output path for a given file and format, preserving relative path structure.
@@ -310,6 +311,7 @@ def get_output_path(
         file_path: The input audio file path
         fmt: The format extension (json, txt, srt)
         output_dir: Optional output directory
+        input_dir: Optional input directory for relative path calculation
         
     Returns:
         The full output path for the given format
@@ -319,10 +321,13 @@ def get_output_path(
     if output_dir:
         # Get the input file's parent directory to extract the relative path structure
         try:
-            # Use relative_to to get the subdirectory structure
-            rel_path = file_path.relative_to(file_path)
-            output_path = output_dir / rel_path.parent / f"{file_stem}.{fmt}"
-            print(output_path)
+            # Only attempt relative_to if input_dir is provided
+            if input_dir is not None:
+                rel_path = file_path.relative_to(input_dir)
+                output_path = output_dir / rel_path.parent / f"{file_stem}.{fmt}"
+            else:
+                # If input_dir is None, just use the filename
+                output_path = output_dir / f"{file_stem}.{fmt}"
         except ValueError:
             # If we can't determine the relative path, just use the filename
             output_path = output_dir / f"{file_stem}.{fmt}"
@@ -340,7 +345,8 @@ async def process_file(
     file_path: AnyPath,
     output_dir: Optional[AnyPath] = None,
     model: str = "whisper-1",
-    derivatives: Optional[List[Literal["txt", "srt"]]] = None
+    derivatives: Optional[List[Literal["txt", "srt"]]] = None,
+    input_dir: Optional[AnyPath] = None
 ) -> None:
     """
     Process a single file: transcribe to JSON and optionally create derivative formats.
@@ -358,7 +364,7 @@ async def process_file(
         derivatives_to_process = derivatives or []
         
         # Get JSON output path and check if it exists
-        json_path = get_output_path(file_path, "json", output_dir)
+        json_path = get_output_path(file_path, "json", output_dir, input_dir=input_dir)
         json_storage = get_storage_manager(json_path)
         json_exists = await json_storage.exists(json_path)
         
@@ -501,7 +507,8 @@ async def process_files(
     concurrency: int = 5,
     model: str = "whisper-1",
     derivatives: Optional[List[Literal["txt", "srt"]]] = None,
-    force: bool = False
+    force: bool = False,
+    input_dir: Optional[AnyPath] = None
 ) -> None:
     """
     Process multiple files concurrently, skipping files that already have outputs unless force=True.
@@ -579,7 +586,8 @@ async def process_files(
                 file_path, 
                 output_dir, 
                 model, 
-                list(missing_derivatives) if not needs_transcription else validated_derivatives
+                list(missing_derivatives) if not needs_transcription else validated_derivatives,
+                input_dir=input_dir,
             )
 
     # Set up progress bar for processing
@@ -644,24 +652,12 @@ async def collect_files(input_path: AnyPath, recursive: bool) -> List[AnyPath]:
                 
         # For directories, use globbing with AnyPath
         audio_files = []
+        existing_files = input_path.rglob("*")
         
-        # Create a list of patterns for audio files
-        patterns = [f"*{ext}" for ext in AUDIO_EXTENSIONS]
-        
-        # Process directory
-        for pattern in patterns:
-            if recursive:
-                # Use ** for recursive search
-                glob_pattern = f"**/{pattern}"
-                for file_path in input_path.glob(glob_pattern):
-                    if not file_path.is_dir():  # Ensure it's a file
-                        audio_files.append(file_path)
-                        progress.update(1)
-            else:
-                for file_path in input_path.glob(pattern):
-                    if not file_path.is_dir():  # Ensure it's a file
-                        audio_files.append(file_path)
-                        progress.update(1)
+        for file_path in existing_files:
+            if is_audio_file(file_path):
+                audio_files.append(file_path)
+            progress.update(1)
         
         # Close the progress bar
         progress.close()
@@ -799,7 +795,8 @@ def main(input_path, output_path, concurrency, recursive, verbose, log_file, mod
             concurrency, 
             model, 
             derivatives_list, 
-            force
+            force,
+            input_path_obj
         )
         
         # Log completion message with appropriate format information
