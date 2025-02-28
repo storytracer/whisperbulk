@@ -424,18 +424,18 @@ async def scan_output_files(output_dir: AnyPath, formats: List[str]) -> Dict[str
     logger.info(f"Scanning existing output files in {output_dir}")
     progress = tqdm(desc="Scanning existing output files", unit="files", leave=True)
     
-    storage = get_storage_manager(output_dir)
-    
-    # Collect files for all formats we're interested in
-    for fmt in formats:
-        pattern = f"*.{fmt}"
-        try:
-            files = await storage.list_files(output_dir, recursive=True, pattern=pattern)
-            for file_path in files:
-                existing_files[str(file_path)] = True
-                progress.update(1)
-        except Exception as e:
-            logger.warning(f"Error listing existing {fmt} files in {output_dir}: {e}")
+    # Create a combined pattern for faster scanning using rglob
+    # This is much faster than calling list_files for each format
+    try:
+        # Use AnyPath's rglob to efficiently find all matching files in one pass
+        for fmt in formats:
+            pattern = f"*.{fmt}"
+            for file_path in output_dir.rglob(pattern):
+                if file_path.is_file():  # Ensure we only include files, not directories
+                    existing_files[str(file_path)] = True
+                    progress.update(1)
+    except Exception as e:
+        logger.warning(f"Error scanning output directory {output_dir}: {e}")
     
     progress.close()
     logger.info(f"Found {len(existing_files)} existing output files in {output_dir}")
