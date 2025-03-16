@@ -197,26 +197,23 @@ async def transcribe_file(file_path: AnyPath, model: str) -> Dict:
     storage = get_storage_manager(file_path)
     file_data = await storage.read_binary(file_path)
     
-    # Create a temporary file
-    file_name = file_path.name
-    temp_file_path = AnyPath(tempfile.NamedTemporaryFile(suffix=file_name, delete=False).name)
-    
-    try:
-        # Write the file data to the temporary file
-        temp_file_path.write_bytes(file_data)
+    # Use a temporary file as a context manager
+    with tempfile.NamedTemporaryFile(suffix=file_path.name) as temp_file:
+        # Write the file data directly to the temp file
+        temp_file.write(file_data)
+        temp_file.flush()  # Ensure data is written to disk
         
-        # Use the temporary file for transcription
-        with temp_file_path.open("rb") as file_obj:
-            response = await openai_client.audio.transcriptions.create(
-                file=file_obj, 
-                model=model,
-                response_format="verbose_json"
-            )
+        # Rewind to the beginning of the file for reading
+        temp_file.seek(0)
+        
+        # Use the temp file directly for transcription
+        response = await openai_client.audio.transcriptions.create(
+            file=temp_file, 
+            model=model,
+            response_format="verbose_json"
+        )
+        
         return response.model_dump() if hasattr(response, "model_dump") else response
-    finally:
-        # Clean up the temporary file
-        if temp_file_path.exists():
-            temp_file_path.unlink()
 
 
 class DerivativeConverter:
