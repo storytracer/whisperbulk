@@ -418,7 +418,7 @@ async def scan_output_files(output_dir: AnyPath, formats: List[str]) -> Set[AnyP
     """
     
     logger.info(f"Scanning existing output files in {output_dir}")
-    progress = tqdm(desc="Scanning existing output files", unit="files", leave=True)
+    progress = tqdm(desc="Scanning existing output files", unit="files", ncols=70, leave=True)
     
     # Create a combined pattern for faster scanning using rglob
     # This is much faster than calling list_files for each format
@@ -580,6 +580,8 @@ async def process_files(
         total=len(files_to_process),
         desc="Transcribing files",
         position=0,
+        smoothing=0.0,
+        ncols=70,
         leave=True
     )
     
@@ -622,6 +624,7 @@ async def collect_files(input_path: AnyPath, recursive: bool) -> List[AnyPath]:
         progress = tqdm(
             desc="Discovering audio files",
             unit="files",
+            ncols=70,
             leave=True
         )
         
@@ -642,7 +645,7 @@ async def collect_files(input_path: AnyPath, recursive: bool) -> List[AnyPath]:
         for file_path in existing_files:
             if is_audio_file(file_path):
                 audio_files.append(file_path)
-            progress.update(1)
+                progress.update(1)
         
         # Close the progress bar
         progress.close()
