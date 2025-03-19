@@ -192,6 +192,7 @@ async def transcribe_file(file_path: AnyPath, model: str) -> Dict:
     """Transcribe a single audio file using the specified Whisper model with retry logic."""
     logger.info(f"Transcribing {file_path} with model {model}")
     
+    result = None
     with open(file_path, "rb") as audio_file:
         # Use the temp file directly for transcription
         response = await openai_client.audio.transcriptions.create(
@@ -200,10 +201,12 @@ async def transcribe_file(file_path: AnyPath, model: str) -> Dict:
             response_format="verbose_json"
         )
         
-        if isinstance(file_path, CloudPath):
-            file_path.clear_cache()
+        result = response.model_dump() if hasattr(response, "model_dump") else response
         
-        return response.model_dump() if hasattr(response, "model_dump") else response
+    if isinstance(file_path, CloudPath):
+        file_path.clear_cache()
+    
+    return result
 
 
 class DerivativeConverter:
