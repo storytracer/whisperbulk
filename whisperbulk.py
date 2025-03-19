@@ -7,7 +7,6 @@ import sys
 import asyncio
 import logging
 import json
-import tempfile
 import aiofiles
 import srt
 import datetime
@@ -193,25 +192,16 @@ async def transcribe_file(file_path: AnyPath, model: str) -> Dict:
     """Transcribe a single audio file using the specified Whisper model with retry logic."""
     logger.info(f"Transcribing {file_path} with model {model}")
     
-    # Read the file data
-    storage = get_storage_manager(file_path)
-    file_data = await storage.read_binary(file_path)
-    
-    # Use a temporary file as a context manager
-    with tempfile.NamedTemporaryFile(suffix=file_path.name) as temp_file:
-        # Write the file data directly to the temp file
-        temp_file.write(file_data)
-        temp_file.flush()  # Ensure data is written to disk
-        
-        # Rewind to the beginning of the file for reading
-        temp_file.seek(0)
-        
+    with open(file_path, "rb") as audio_file:
         # Use the temp file directly for transcription
         response = await openai_client.audio.transcriptions.create(
-            file=temp_file, 
+            file=audio_file, 
             model=model,
             response_format="verbose_json"
         )
+        
+        if isinstance(file_path, CloudPath):
+            file_path.clear_cache()
         
         return response.model_dump() if hasattr(response, "model_dump") else response
 
