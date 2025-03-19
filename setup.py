@@ -10,15 +10,14 @@ setup(
     py_modules=["whisperbulk"],
     install_requires=[
         "click",
-        "openai>=1.1.0",  # Ensure we use the version with the latest async API support
+        "openai",  # Ensure we use the version with the latest async API support
         "tenacity",
         "python-dotenv",
         "tqdm",
         "aiofiles",
         "srt",  # For SRT subtitle file generation
-        "universal-pathlib>=0.1.0",  # For unified path handling (local and cloud)
-        "s3fs>=2023.0.0",  # For S3 filesystem support
-        "fsspec>=2023.0.0",  # Filesystem interface that supports multiple backends
+        "universal-pathlib",  # For unified path handling (local and cloud)
+        "fsspec[s3]",  # Filesystem interface that supports multiple backends
     ],
     entry_points={
         "console_scripts": [
