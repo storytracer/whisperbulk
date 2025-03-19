@@ -395,44 +395,6 @@ async def save_derivative(
     logger.info(f"Saved {format_name.upper()} derivative to {output_path}")
 
 
-def get_output_path(
-    file_path: UPath,
-    fmt: str,
-    output_dir: UPath,
-    input_dir: UPath
-) -> UPath:
-    """
-    Generate the output path for a given file and format, preserving relative path structure.
-    
-    Args:
-        file_path: The input audio file path
-        fmt: The format extension (json, txt, srt)
-        output_dir: Output directory
-        input_dir: Input directory for relative path calculation
-        
-    Returns:
-        The full output path for the given format
-    """
-    file_stem = file_path.stem
-    
-    # Handle relative paths differently based on protocol
-    if file_path.protocol == input_dir.protocol:
-        # For same protocol, we can use relative_to
-        try:
-            rel_path = file_path.relative_to(input_dir)
-            output_path = output_dir / rel_path.parent / f"{file_stem}.{fmt}"
-        except ValueError:
-            # If relative_to fails, use a flattened structure
-            output_path = output_dir / f"{file_stem}.{fmt}"
-    else:
-        # For different protocols, use a flattened structure
-        output_path = output_dir / f"{file_stem}.{fmt}"
-    
-    # Ensure the directory exists
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    return output_path
-
 
 async def process_file(
     file_path: UPath,
@@ -440,7 +402,7 @@ async def process_file(
     input_dir: UPath,
     model: str = "Systran/faster-whisper-medium",
     derivatives: Optional[List[Literal["txt", "srt"]]] = None,
-    file_manager: Optional[FileManager] = None
+    file_manager: FileManager = None
 ) -> None:
     """
     Process a single file: transcribe to JSON and optionally create derivative formats.
@@ -451,7 +413,7 @@ async def process_file(
         input_dir: Input directory for relative path calculation
         model: Whisper model to use for transcription
         derivatives: Derivative formats to generate (txt, srt)
-        file_manager: Optional FileManager instance to use for path generation
+        file_manager: FileManager instance to use for path generation (required)
     """
     try:
         logger.info(f"Processing file: {file_path}")
@@ -459,11 +421,8 @@ async def process_file(
         # Set empty list if derivatives is None
         derivatives_to_process = derivatives or []
         
-        # Use FileManager if provided, otherwise use the standalone function
-        if file_manager:
-            json_path = file_manager.get_output_path(file_path, "json")
-        else:
-            json_path = get_output_path(file_path, "json", output_dir, input_dir)
+        # Get the JSON output path
+        json_path = file_manager.get_output_path(file_path, "json")
             
         # Check if JSON file exists
         json_exists = json_path.exists()
@@ -505,11 +464,8 @@ async def process_file(
         
         # STEP 3: Create derivative formats if requested
         for fmt in derivatives_to_process:
-            # Use FileManager if provided, otherwise use the standalone function
-            if file_manager:
-                output_path = file_manager.get_output_path(file_path, fmt)
-            else:
-                output_path = get_output_path(file_path, fmt, output_dir, input_dir)
+            # Get the output path for this derivative format
+            output_path = file_manager.get_output_path(file_path, fmt)
             
             # Check if this derivative already exists
             if not output_path.exists():
