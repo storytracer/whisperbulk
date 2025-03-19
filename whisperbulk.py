@@ -20,8 +20,8 @@ import dotenv
 from openai import AsyncOpenAI
 import tenacity
 from tqdm import tqdm
-from cloudpathlib import AnyPath, CloudPath, S3Path
-from aiobotocore.session import get_session
+from upath import UPath
+import s3fs
 
 # Constants
 AUDIO_EXTENSIONS = (".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm")
@@ -31,7 +31,7 @@ DERIVATIVE_FORMATS = ["txt", "srt"]
 dotenv.load_dotenv()
 
 # Setup logging
-log_dir = AnyPath(__file__).parent / "logs"
+log_dir = UPath(__file__).parent / "logs"
 log_dir.mkdir(exist_ok=True)
 log_file = log_dir / "whisperbulk.log"
 
@@ -47,55 +47,40 @@ logger = logging.getLogger("whisperbulk")
 openai_client = AsyncOpenAI()
 
 
-class StorageManager(ABC):
-    """Abstract base class for storage operations."""
+class StorageManager:
+    """Unified storage manager for both local and cloud operations using UPath."""
     
-    @abstractmethod
-    async def exists(self, path: AnyPath) -> bool:
+    async def exists(self, path: UPath) -> bool:
         """Check if a file exists."""
-        pass
-    
-    @abstractmethod
-    async def read_binary(self, path: AnyPath) -> bytes:
-        """Read a file as binary data."""
-        pass
-    
-    @abstractmethod
-    async def write_text(self, path: AnyPath, content: str) -> None:
-        """Write string content to a file."""
-        pass
-    
-    @abstractmethod
-    async def list_files(self, path: AnyPath, 
-                         recursive: bool, pattern: Optional[str] = None) -> List[AnyPath]:
-        """List files in a directory matching the pattern."""
-        pass
-
-
-class LocalStorageManager(StorageManager):
-    """Manages local file operations using asyncio."""
-    
-    async def exists(self, path: AnyPath) -> bool:
-        """Check if a local file exists."""
         return path.exists()
     
-    async def read_binary(self, path: AnyPath) -> bytes:
-        """Read a local file as binary data."""
-        async with aiofiles.open(str(path), 'rb') as f:
-            return await f.read()
+    async def read_binary(self, path: UPath) -> bytes:
+        """Read a file as binary data."""
+        if path.protocol == "file":
+            # Use aiofiles for local files to get async IO benefits
+            async with aiofiles.open(str(path), 'rb') as f:
+                return await f.read()
+        else:
+            # For cloud paths, use UPath's built-in methods
+            # This is synchronous but wrapped in async for API consistency
+            return path.read_bytes()
     
-    async def write_text(self, path: AnyPath, content: str) -> None:
-        """Write string content to a local file."""
+    async def write_text(self, path: UPath, content: str) -> None:
+        """Write string content to a file."""
         # Ensure directory exists
         path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Write content
-        async with aiofiles.open(str(path), 'w', encoding='utf-8') as f:
-            await f.write(content)
+        if path.protocol == "file":
+            # Use aiofiles for local files to get async IO benefits
+            async with aiofiles.open(str(path), 'w', encoding='utf-8') as f:
+                await f.write(content)
+        else:
+            # For cloud paths, use UPath's built-in methods
+            path.write_text(content)
     
-    async def list_files(self, path: AnyPath, 
-                         recursive: bool, pattern: Optional[str] = None) -> List[AnyPath]:
-        """List local files matching the pattern."""
+    async def list_files(self, path: UPath, 
+                         recursive: bool, pattern: Optional[str] = None) -> List[UPath]:
+        """List files matching the pattern."""
         if path.is_file():
             return [path]
         
@@ -123,77 +108,6 @@ class LocalStorageManager(StorageManager):
         return files
 
 
-class CloudStorageManager(StorageManager):
-    """Manages cloud operations using cloudpathlib."""
-    
-    async def exists(self, path: AnyPath) -> bool:
-        """Check if a file exists in cloud storage."""
-        return path.exists()
-    
-    async def read_binary(self, path: AnyPath) -> bytes:
-        """Read a file from cloud storage as binary data."""
-        with path.open('rb') as f:
-            return f.read()
-    
-    async def write_text(self, path: AnyPath, content: str) -> None:
-        """Write string content to a cloud file."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
-    
-    async def list_files(self, path: AnyPath, 
-                        recursive: bool, pattern: Optional[str] = None) -> List[AnyPath]:
-        """List files in cloud storage using aiobotocore for S3 and cloudpathlib for others."""
-        if isinstance(path, S3Path):
-            # Get patterns to filter by
-            patterns = []
-            if pattern:
-                patterns = [pattern]
-            else:
-                patterns = [f"*{ext}" for ext in AUDIO_EXTENSIONS]
-                
-            # Extract bucket and prefix from path
-            bucket = path.bucket
-            # Remove leading slash if present
-            prefix = path.key
-            if prefix.startswith('/'):
-                prefix = prefix[1:]
-            if prefix and not prefix.endswith('/'):
-                prefix += '/'
-                
-            session = get_session()
-            async with session.create_client('s3') as client:
-                files = []
-                
-                # list_objects_v2 already handles recursion
-                paginator = client.get_paginator('list_objects_v2')
-                async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-                    if 'Contents' in page:
-                        for obj in page['Contents']:
-                            # Skip "directory" objects (keys ending with /)
-                            key = obj['Key']
-                            if key.endswith('/'):
-                                continue
-                                
-                            # Check if the file matches any of our patterns
-                            file_name = key.split('/')[-1]
-                            for pat in patterns:
-                                if fnmatch.fnmatch(file_name, pat):
-                                    # Convert back to CloudPath
-                                    s3_path = CloudPath(f"s3://{bucket}/{key}")
-                                    files.append(s3_path)
-                                    break
-                                    
-                return files
-
-
-def get_storage_manager(path: AnyPath) -> StorageManager:
-    """Factory function to get the appropriate storage manager."""
-    if isinstance(path, CloudPath):
-        return CloudStorageManager()
-    else:
-        return LocalStorageManager()
-
-
 @tenacity.retry(
     retry=tenacity.retry_if_exception_type(Exception),
     wait=tenacity.wait_exponential(multiplier=1, min=4, max=60),
@@ -203,7 +117,7 @@ def get_storage_manager(path: AnyPath) -> StorageManager:
         f"{retry_state.outcome.exception() if retry_state.outcome else 'Unknown error'}"
     ),
 )
-async def transcribe_file(file_path: AnyPath, model: str) -> Dict:
+async def transcribe_file(file_path: UPath, model: str) -> Dict:
     """Transcribe a single audio file using the specified Whisper model with retry logic."""
     logger.info(f"Transcribing {file_path} with model {model}")
     
@@ -217,9 +131,6 @@ async def transcribe_file(file_path: AnyPath, model: str) -> Dict:
         )
         
         result = response.model_dump() if hasattr(response, "model_dump") else response
-        
-    if isinstance(file_path, CloudPath):
-        file_path.clear_cache()
     
     return result
 
@@ -269,14 +180,14 @@ class DerivativeConverter:
 
 async def save_json_transcription(
     transcription_data: Dict,
-    output_path: AnyPath
+    output_path: UPath
 ) -> None:
     """Save transcription results as JSON."""
     # Format as JSON string
     content = json.dumps(transcription_data, indent=2, ensure_ascii=False)
     
-    # Use the appropriate storage manager to write the file
-    storage = get_storage_manager(output_path)
+    # Use the storage manager to write the file
+    storage = StorageManager()
     await storage.write_text(output_path, content)
     
     logger.info(f"Saved JSON transcription to {output_path}")
@@ -284,7 +195,7 @@ async def save_json_transcription(
 
 async def save_derivative(
     transcription_data: Dict,
-    output_path: AnyPath,
+    output_path: UPath,
     format_name: Literal["txt", "srt"]
 ) -> None:
     """Save transcription results in a derivative format (txt or srt)."""
@@ -296,19 +207,19 @@ async def save_derivative(
     else:
         raise ValueError(f"Unsupported derivative format: {format_name}")
     
-    # Use the appropriate storage manager to write the file
-    storage = get_storage_manager(output_path)
+    # Use the storage manager to write the file
+    storage = StorageManager()
     await storage.write_text(output_path, content)
     
     logger.info(f"Saved {format_name.upper()} derivative to {output_path}")
 
 
 def get_output_path(
-    file_path: AnyPath,
+    file_path: UPath,
     fmt: str,
-    output_dir: AnyPath,
-    input_dir: AnyPath
-) -> AnyPath:
+    output_dir: UPath,
+    input_dir: UPath
+) -> UPath:
     """
     Generate the output path for a given file and format, preserving relative path structure.
     
@@ -323,8 +234,18 @@ def get_output_path(
     """
     file_stem = file_path.stem
     
-    rel_path = file_path.relative_to(input_dir)
-    output_path = output_dir / rel_path.parent / f"{file_stem}.{fmt}"
+    # Handle relative paths differently based on protocol
+    if file_path.protocol == input_dir.protocol:
+        # For same protocol, we can use relative_to
+        try:
+            rel_path = file_path.relative_to(input_dir)
+            output_path = output_dir / rel_path.parent / f"{file_stem}.{fmt}"
+        except ValueError:
+            # If relative_to fails, use a flattened structure
+            output_path = output_dir / f"{file_stem}.{fmt}"
+    else:
+        # For different protocols, use a flattened structure
+        output_path = output_dir / f"{file_stem}.{fmt}"
     
     # Ensure the directory exists
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -333,9 +254,9 @@ def get_output_path(
 
 
 async def process_file(
-    file_path: AnyPath,
-    output_dir: AnyPath,
-    input_dir: AnyPath,
+    file_path: UPath,
+    output_dir: UPath,
+    input_dir: UPath,
     model: str = "whisper-1",
     derivatives: Optional[List[Literal["txt", "srt"]]] = None
 ) -> None:
@@ -357,8 +278,8 @@ async def process_file(
         
         # Get JSON output path and check if it exists
         json_path = get_output_path(file_path, "json", output_dir, input_dir)
-        json_storage = get_storage_manager(json_path)
-        json_exists = await json_storage.exists(json_path)
+        storage = StorageManager()
+        json_exists = await storage.exists(json_path)
         
         # Initialize results and tasks
         transcription_data = None
@@ -369,7 +290,7 @@ async def process_file(
             logger.info(f"Found existing JSON file: {json_path}")
             # Load and parse the JSON file
             try:
-                json_content = await json_storage.read_binary(json_path)
+                json_content = await storage.read_binary(json_path)
                 json_text = json_content.decode('utf-8')
                 transcription_data = json.loads(json_text)
             except json.JSONDecodeError as e:
@@ -392,8 +313,7 @@ async def process_file(
             output_path = get_output_path(file_path, fmt, output_dir, input_dir)
             
             # Check if this derivative already exists
-            output_storage = get_storage_manager(output_path)
-            if not await output_storage.exists(output_path):
+            if not await storage.exists(output_path):
                 logger.info(f"Creating {fmt} derivative: {output_path}")
                 save_tasks.append(save_derivative(
                     transcription_data,
@@ -413,7 +333,7 @@ async def process_file(
         raise
 
 
-async def scan_output_files(output_dir: AnyPath, formats: List[str]) -> Set[AnyPath]:
+async def scan_output_files(output_dir: UPath, formats: List[str]) -> Set[UPath]:
     """
     Efficiently scan and cache all existing output files in the output directory.
     
@@ -428,18 +348,18 @@ async def scan_output_files(output_dir: AnyPath, formats: List[str]) -> Set[AnyP
     logger.info(f"Scanning existing output files in {output_dir}")
     progress = tqdm(desc="Scanning existing output files", unit="files", ncols=70, leave=True)
     
-    # Create a combined pattern for faster scanning using rglob
-    # This is much faster than calling list_files for each format
+    # Create a combined pattern for faster scanning
     try:
         output_files = set()
-        existing_files = output_dir.rglob("*")
         
-        for file_path in existing_files:
-            for fmt in formats:
-                if file_path.name.endswith(f".{fmt}"):
+        for fmt in formats:
+            # Use glob to find files with the specific extension
+            pattern = f"*.{fmt}"
+            if output_dir.is_dir():
+                # Recursively find all files with the given extension
+                for file_path in output_dir.rglob(pattern):
                     output_files.add(file_path)
                     progress.update(1)
-                    break
                 
     except Exception as e:
         logger.warning(f"Error scanning output directory {output_dir}: {e}")
@@ -450,11 +370,11 @@ async def scan_output_files(output_dir: AnyPath, formats: List[str]) -> Set[AnyP
 
 
 def check_file_needs_processing(
-    file_path: AnyPath,
+    file_path: UPath,
     derivatives: Optional[List[str]],
-    existing_files_cache: Set[AnyPath],
-    output_dir: AnyPath,
-    input_dir: AnyPath
+    existing_files_cache: Set[UPath],
+    output_dir: UPath,
+    input_dir: UPath
 ) -> tuple[bool, bool, Set[str]]:
     """
     Check if a file needs transcription and/or derivative creation.
@@ -494,9 +414,9 @@ def check_file_needs_processing(
 
 
 async def process_files(
-    files: List[AnyPath],
-    output_dir: AnyPath,
-    input_dir: AnyPath,
+    files: List[UPath],
+    output_dir: UPath,
+    input_dir: UPath,
     concurrency: int = 5,
     model: str = "whisper-1",
     derivatives: Optional[List[Literal["txt", "srt"]]] = None,
@@ -525,7 +445,7 @@ async def process_files(
     
     # Step 1: Scan for existing output files if not in force mode
     scan_formats = ["json"] + validated_derivatives
-    existing_files_cache: Set[AnyPath] = set()
+    existing_files_cache: Set[UPath] = set()
     if not force:
         existing_files_cache = await scan_output_files(output_dir, scan_formats)
     
@@ -609,14 +529,14 @@ async def process_files(
     progress.close()
 
 
-def is_audio_file(path: AnyPath) -> bool:
+def is_audio_file(path: UPath) -> bool:
     """Check if a file is a supported audio format."""
     return path.suffix.lower() in AUDIO_EXTENSIONS
 
 
-async def collect_files(input_path: AnyPath, recursive: bool) -> List[AnyPath]:
+async def collect_files(input_path: UPath, recursive: bool) -> List[UPath]:
     """
-    Collect audio files using AnyPath.
+    Collect audio files using UPath.
     
     Args:
         input_path: The input directory or file path
@@ -646,14 +566,24 @@ async def collect_files(input_path: AnyPath, recursive: bool) -> List[AnyPath]:
                 progress.close()
                 return []
                 
-        # For directories, use globbing with AnyPath
+        # For directories, use globbing with UPath
         audio_files = []
-        existing_files = input_path.rglob("*")
         
-        for file_path in existing_files:
-            if is_audio_file(file_path):
-                audio_files.append(file_path)
-                progress.update(1)
+        # Use the appropriate glob method based on recursive flag
+        if recursive:
+            # Use rglob for recursive search
+            for ext in AUDIO_EXTENSIONS:
+                pattern = f"*{ext}"
+                for file_path in input_path.rglob(pattern):
+                    audio_files.append(file_path)
+                    progress.update(1)
+        else:
+            # Use glob for non-recursive search
+            for ext in AUDIO_EXTENSIONS:
+                pattern = f"*{ext}"
+                for file_path in input_path.glob(pattern):
+                    audio_files.append(file_path)
+                    progress.update(1)
         
         # Close the progress bar
         progress.close()
@@ -734,15 +664,15 @@ def main(input_path, output_path, concurrency, recursive, verbose, log_file, mod
     
         whisperbulk ./audio_files ./transcriptions --force
     """
-    # Convert input and output paths to AnyPath objects
-    input_path_obj = AnyPath(input_path)
-    output_path_obj = AnyPath(output_path) if output_path else None
+    # Convert input and output paths to UPath objects
+    input_path_obj = UPath(input_path)
+    output_path_obj = UPath(output_path) if output_path else None
     
     # Configure logging
     if log_file:
         # If user provided custom log file path
-        log_path = AnyPath(log_file)
-        if log_path.parent != AnyPath('.'):
+        log_path = UPath(log_file)
+        if log_path.parent != UPath('.'):
             log_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Reconfigure the logging to use the custom file
@@ -760,7 +690,7 @@ def main(input_path, output_path, concurrency, recursive, verbose, log_file, mod
         logger.setLevel(logging.DEBUG)
 
     # Ensure output directory exists if it's local
-    if output_path_obj:
+    if output_path_obj and output_path_obj.protocol == "file":
         output_path_obj.parent.mkdir(parents=True, exist_ok=True)
 
     # Use asyncio to run the entire pipeline

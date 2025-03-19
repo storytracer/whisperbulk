@@ -34,9 +34,11 @@ Required Python packages:
 - click
 - openai
 - tenacity
-- smart_open
 - python-dotenv
 - tqdm
+- universal_pathlib
+- s3fs
+- fsspec
 
 ## Usage
 

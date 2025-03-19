@@ -4,8 +4,8 @@ setup(
     name="whisperbulk",
     version="0.1.0",
     description="A CLI tool for bulk transcribing audio files using OpenAI's Whisper API",
-    author="Your Name",
-    author_email="your.email@example.com",
+    author="Sebastian Majstorovic",
+    author_email="storytracer@gmail.com",
     packages=find_packages(),
     py_modules=["whisperbulk"],
     install_requires=[
@@ -15,19 +15,11 @@ setup(
         "python-dotenv",
         "tqdm",
         "aiofiles",
-        "aiobotocore",
         "srt",  # For SRT subtitle file generation
-        "cloudpathlib>=0.15.0",  # For unified path handling (local and cloud)
+        "universal-pathlib>=0.1.0",  # For unified path handling (local and cloud)
+        "s3fs>=2023.0.0",  # For S3 filesystem support
+        "fsspec>=2023.0.0",  # Filesystem interface that supports multiple backends
     ],
-    extras_require={
-        "dev": [
-            "flake8",
-            "mypy",
-            "types-aiofiles",
-            "types-tqdm",
-            "types-cloudpathlib",
-        ],
-    },
     entry_points={
         "console_scripts": [
             "whisperbulk=whisperbulk:main",
