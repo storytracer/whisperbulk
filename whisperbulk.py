@@ -10,6 +10,7 @@ import json
 import aiofiles
 import srt
 import datetime
+import fnmatch
 from typing import List, Optional, Union, Any, Dict, Literal, Set
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
@@ -20,6 +21,7 @@ from openai import AsyncOpenAI
 import tenacity
 from tqdm import tqdm
 from cloudpathlib import AnyPath, CloudPath
+from aiobotocore.session import get_session
 
 # Constants
 AUDIO_EXTENSIONS = (".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm")
@@ -140,35 +142,52 @@ class CloudStorageManager(StorageManager):
     
     async def list_files(self, path: AnyPath, 
                         recursive: bool, pattern: Optional[str] = None) -> List[AnyPath]:
-        """List files in cloud storage using cloudpathlib."""
+        """List files in cloud storage using aiobotocore for S3 and cloudpathlib for others."""
         if path.is_file():
             return [path]
         
-        files = []
-        
-        # Handle pattern or use default audio extensions
-        patterns = []
-        if pattern:
-            patterns = [pattern]
-        else:
-            # Use audio extensions for filtering
-            patterns = [f"*{ext}" for ext in AUDIO_EXTENSIONS]
-        
-        for pattern in patterns:
-            # Use glob or rglob based on recursive flag
-            if recursive:
-                # Use ** for recursive search
-                if path.is_dir():
-                    glob_pattern = f"**/{pattern}"
-                    files.extend(list(path.glob(glob_pattern)))
+        # Handle S3 paths specifically
+        if isinstance(path, CloudPath) and path.protocol == "s3":
+            # Get patterns to filter by
+            patterns = []
+            if pattern:
+                patterns = [pattern]
             else:
-                # Non-recursive glob
-                files.extend(list(path.glob(pattern)))
-        
-        # Filter out directories from results
-        files = [f for f in files if not f.is_dir()]
-        
-        return files
+                patterns = [f"*{ext}" for ext in AUDIO_EXTENSIONS]
+                
+            # Extract bucket and prefix from path
+            bucket = path.bucket
+            # Remove leading slash if present
+            prefix = path.key
+            if prefix.startswith('/'):
+                prefix = prefix[1:]
+            if prefix and not prefix.endswith('/'):
+                prefix += '/'
+                
+            session = get_session()
+            async with session.create_client('s3') as client:
+                files = []
+                
+                # list_objects_v2 already handles recursion
+                paginator = client.get_paginator('list_objects_v2')
+                async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                    if 'Contents' in page:
+                        for obj in page['Contents']:
+                            # Skip "directory" objects (keys ending with /)
+                            key = obj['Key']
+                            if key.endswith('/'):
+                                continue
+                                
+                            # Check if the file matches any of our patterns
+                            file_name = key.split('/')[-1]
+                            for pat in patterns:
+                                if fnmatch.fnmatch(file_name, pat):
+                                    # Convert back to CloudPath
+                                    s3_path = CloudPath(f"s3://{bucket}/{key}")
+                                    files.append(s3_path)
+                                    break
+                                    
+                return files
 
 
 def get_storage_manager(path: AnyPath) -> StorageManager:
