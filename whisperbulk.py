@@ -20,7 +20,7 @@ import dotenv
 from openai import AsyncOpenAI
 import tenacity
 from tqdm import tqdm
-from cloudpathlib import AnyPath, CloudPath
+from cloudpathlib import AnyPath, CloudPath, S3Path
 from aiobotocore.session import get_session
 
 # Constants
@@ -143,11 +143,7 @@ class CloudStorageManager(StorageManager):
     async def list_files(self, path: AnyPath, 
                         recursive: bool, pattern: Optional[str] = None) -> List[AnyPath]:
         """List files in cloud storage using aiobotocore for S3 and cloudpathlib for others."""
-        if path.is_file():
-            return [path]
-        
-        # Handle S3 paths specifically
-        if isinstance(path, CloudPath) and path.protocol == "s3":
+        if isinstance(path, S3Path):
             # Get patterns to filter by
             patterns = []
             if pattern:
