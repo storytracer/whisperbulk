@@ -69,6 +69,27 @@ class FileUtils:
             output_files[suffix].add(path)
             return True
         return False
+    
+    @staticmethod
+    def riterdir(path: UPath):
+        """Recursively iterate through all files in a directory.
+        
+        This is a replacement for the non-existent riterdir method in UPath.
+        
+        Args:
+            path: The UPath directory to recursively iterate through
+            
+        Yields:
+            UPath objects for all files found recursively
+        """
+        # Start with the contents of the directory
+        for item in path.iterdir():
+            # If it's a directory, recursively iterate through its contents
+            if item.is_dir():
+                yield from FileUtils.riterdir(item)
+            # If it's a file, yield it
+            else:
+                yield item
 
 
 class FileManager:
@@ -77,18 +98,16 @@ class FileManager:
     Bulk lists all files in input and output paths at initialization and keeps them in memory.
     """
     
-    def __init__(self, input_path: UPath, output_path: UPath, recursive: bool = False):
+    def __init__(self, input_path: UPath, output_path: UPath):
         """
         Initialize the FileManager with input and output paths.
         
         Args:
             input_path: The input directory path
             output_path: The output directory path
-            recursive: Whether to search subdirectories
         """
         self.input_path = input_path
         self.output_path = output_path
-        self.recursive = recursive
         
         # Cache for discovered files
         self.input_files: List[UPath] = []
@@ -98,84 +117,30 @@ class FileManager:
         self._scan_input_files()
         self._scan_output_files()
     
-    def _list_files_recursive(self, directory: UPath, file_filter=None, progress=None):
-        """
-        Recursively list files in a directory using iterdir() instead of rglob().
-        
-        Args:
-            directory: The directory to search
-            file_filter: Optional function to filter files (returns True to include)
-            progress: Optional progress bar to update
-            
-        Returns:
-            List of UPath objects for matching files
-        """
-        result = []
-        
-        # Stack for directories to process (depth-first traversal)
-        dirs_to_process = [directory]
-        
-        while dirs_to_process:
-            current_dir = dirs_to_process.pop()
-            
-            try:
-                # Use iterdir() to list all items in the current directory
-                for item in current_dir.iterdir():
-                    try:
-                        # If it's a file and passes the filter, add it to results
-                        if item.is_file():
-                            if file_filter is None or file_filter(item):
-                                result.append(item)
-                                if progress:
-                                    progress.update(1)
-                                    progress.refresh()  # Manually refresh the progress bar
-                        
-                        # If it's a directory and recursive is enabled, add to processing stack
-                        elif item.is_dir() and self.recursive:
-                            dirs_to_process.append(item)
-                    
-                    except Exception as e:
-                        logger.warning(f"Error processing {item}: {e}")
-            
-            except Exception as e:
-                logger.warning(f"Error accessing directory {current_dir}: {e}")
-        
-        return result
     
     def _scan_input_files(self):
         """Scan and cache all audio files in the input path."""
         logger.info(f"Scanning input path for audio files: {self.input_path}")
         
-        # Create progress bar without a total (unknown at start)
-        progress = tqdm(
-            desc="Discovering audio files",
+        # Collect all files in a single step using our recursive directory iterator
+        all_files = list(tqdm(
+            FileUtils.riterdir(self.input_path),
+            desc="Discovering files",
             unit="files",
             ncols=PROGRESS_BAR_WIDTH,
             leave=True
-        )
+        ))
         
-        # Use our helper function to list all audio files
-        self.input_files = self._list_files_recursive(
-            self.input_path,
-            file_filter=FileUtils.is_audio_file,
-            progress=progress
-        )
+        # Filter for audio files
+        self.input_files = [file for file in all_files if FileUtils.is_audio_file(file)]
         
-        # Update the progress total to match the actual count
-        progress.total = len(self.input_files)
-        # Set to the correct number of files found
-        progress.n = len(self.input_files)
-        # Ensure the progress bar is refreshed with the final count
-        progress.refresh()
-        
-        # Close the progress bar
-        progress.close()
+        # Display summary
+        print(f"Found {len(self.input_files)} audio files out of {len(all_files)} total files")
         
         if not self.input_files and self.input_path.is_dir():
             print("No audio files found.")
             logger.warning(
-                f"{self.input_path} is a directory with no audio files. "
-                f"Use --recursive to process subdirectories if needed."
+                f"{self.input_path} is a directory with no audio files."
             )
         
         logger.info(f"Found {len(self.input_files)} audio files to process")
@@ -188,39 +153,36 @@ class FileManager:
             self.output_files[fmt] = set()
         
         logger.info(f"Scanning existing output files in {self.output_path}")
-        progress = tqdm(desc="Scanning existing output files", unit="files", ncols=PROGRESS_BAR_WIDTH, leave=True)
         
         # Skip if output directory doesn't exist yet
         if not self.output_path.exists():
-            progress.close()
             logger.info("Output directory does not exist yet, no existing files to scan")
             return
-        
-        try:
-            # Create a closure to capture self.output_files for the filter function
-            def output_file_filter(path):
-                return FileUtils.is_output_file(path, self.output_files)
             
-            # Use our helper function to list all output files
-            self._list_files_recursive(
-                self.output_path,
-                file_filter=output_file_filter,
-                progress=progress
-            )
+        try:
+            # Collect all files in a single step using our recursive directory iterator
+            all_files = list(tqdm(
+                FileUtils.riterdir(self.output_path),
+                desc="Scanning existing output files",
+                unit="files",
+                ncols=PROGRESS_BAR_WIDTH,
+                leave=True
+            ))
+            
+            # Process and categorize files after collecting them all
+            for path in all_files:
+                FileUtils.is_output_file(path, self.output_files)
+                
         except Exception as e:
             logger.warning(f"Error scanning output directory {self.output_path}: {e}")
+            all_files = []
         
         # Count total files found
         total_files = sum(len(files) for files in self.output_files.values())
         
-        # Update the progress bar with the correct total
-        progress.total = total_files
-        progress.n = total_files
-        # Ensure the progress bar is refreshed with the final count
-        progress.refresh()
+        # Display summary
+        print(f"Found {total_files} output files out of {len(all_files)} total files")
         
-        # Close the progress bar
-        progress.close()
         logger.info(f"Found {total_files} existing output files in {self.output_path}")
     
     def get_audio_files(self) -> List[UPath]:
@@ -674,10 +636,6 @@ class TranscriptionProcessor:
     help="Number of concurrent transcription requests"
 )
 @click.option(
-    "--recursive", "-r", is_flag=True,
-    help="Recursively process directories"
-)
-@click.option(
     "--verbose", "-v", is_flag=True,
     help="Enable verbose logging to the log file"
 )
@@ -698,7 +656,7 @@ class TranscriptionProcessor:
     "--force", is_flag=True,
     help="Force processing of all files, even if output files already exist"
 )
-def main(input_path, output_path, concurrency, recursive, verbose, log_file, model, derivative, force):
+def main(input_path, output_path, concurrency, verbose, log_file, model, derivative, force):
     """Bulk transcribe audio files using Whisper models.
 
     INPUT_PATH is the source directory (or s3:// URI).
@@ -713,9 +671,11 @@ def main(input_path, output_path, concurrency, recursive, verbose, log_file, mod
     The tool generates JSON transcriptions and optionally creates derivative 
     formats (txt or srt) from these transcriptions.
 
+    All input and output directories are scanned recursively.
+
     Example usage:
 
-        whisperbulk ./audio_files ./transcriptions -c 10 -r
+        whisperbulk ./audio_files ./transcriptions -c 10
         whisperbulk s3://mybucket/audio s3://mybucket/transcriptions -m whisper-1 -d srt
         
     You can specify multiple derivative formats:
@@ -764,7 +724,7 @@ def main(input_path, output_path, concurrency, recursive, verbose, log_file, mod
     # Use asyncio to run the entire pipeline
     async def run_pipeline():
         # Initialize the FileManager to bulk list all input and output files
-        file_manager = FileManager(input_path_obj, output_path_obj, recursive)
+        file_manager = FileManager(input_path_obj, output_path_obj)
         
         # Check if we found any audio files
         if not file_manager.get_audio_files():
