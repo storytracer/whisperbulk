@@ -99,6 +99,29 @@ class FileUtils:
     
     
     @staticmethod
+    def parse_s3_path(s3_path):
+        """Parse an S3 path into bucket and key components.
+        
+        Args:
+            s3_path: An S3 path in the format s3://bucket/key
+            
+        Returns:
+            Tuple of (bucket, key)
+        """
+        # Remove s3:// prefix and split by first slash
+        path_str = str(s3_path)
+        if not path_str.startswith('s3://'):
+            raise ValueError(f"Not an S3 path: {path_str}")
+            
+        path = path_str.replace('s3://', '')
+        parts = path.split('/', 1)
+        
+        bucket = parts[0]
+        key = parts[1] if len(parts) > 1 else ''
+        
+        return bucket, key
+
+    @staticmethod
     async def riterdir(path: UPath):
         """Recursively iterate through all files in a directory.
         
@@ -114,19 +137,15 @@ class FileUtils:
         # Special optimized path for S3
         if path.protocol == 's3':
             logger.info(f"Using optimized S3 listing for {path}")
-            # Get bucket and prefix directly from the UPath object
-            bucket = path.bucket
-            # The prefix should be the key part of the path (everything after the bucket)
-            prefix = path.key
+            # Parse the S3 path to get bucket and prefix
+            bucket, prefix = FileUtils.parse_s3_path(path)
             
             # Use aiobotocore to list objects directly
             object_keys = await FileUtils.list_s3_objects(bucket, prefix)
             
-            # Create S3Path objects using the base path and joining with the keys
-            base_path = UPath(f"s3://{bucket}")
+            # Create S3Path objects using UPath
             for key in object_keys:
-                # This correctly uses UPath's joining logic to create a proper S3Path
-                yield base_path / key
+                yield UPath(f"s3://{bucket}/{key}")
         else:
             # For non-S3 paths, use the standard fsspec implementation
             fs = path.fs
