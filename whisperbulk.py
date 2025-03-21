@@ -99,6 +99,89 @@ class FileUtils:
                 
                 if page_keys:
                     yield page_keys
+                    
+    @staticmethod
+    async def list_s3_objects_parallel_async(bucket, prefix, delimiter='/', concurrency=20):
+        """List all objects in an S3 bucket with parallel async processing.
+        
+        This method uses async concurrency to explore directories (common prefixes)
+        in parallel, which can significantly improve performance for buckets with
+        many subdirectories.
+        
+        Args:
+            bucket: The S3 bucket name
+            prefix: The prefix to filter objects by
+            delimiter: The delimiter to use (default: '/')
+            concurrency: Maximum number of concurrent tasks (default: 20)
+            
+        Yields:
+            Lists of S3 object keys found in batches
+        """
+        # Create a semaphore to limit concurrency
+        sem = asyncio.Semaphore(concurrency)
+        
+        # Function to list objects and prefixes at a specific prefix
+        async def list_prefix(current_prefix):
+            async with sem:
+                session = get_session()
+                async with session.create_client('s3') as client:
+                    paginator = client.get_paginator('list_objects_v2')
+                    objects = []
+                    common_prefixes = []
+                    
+                    async for page in paginator.paginate(Bucket=bucket, Prefix=current_prefix, Delimiter=delimiter):
+                        if 'Contents' in page:
+                            for obj in page['Contents']:
+                                # Skip directories (objects ending with '/')
+                                if not obj['Key'].endswith('/'):
+                                    objects.append(obj['Key'])
+                        
+                        if 'CommonPrefixes' in page:
+                            for common_prefix in page['CommonPrefixes']:
+                                common_prefixes.append(common_prefix['Prefix'])
+                    
+                    return {'objects': objects, 'common_prefixes': common_prefixes}
+        
+        # Queue of prefixes to process
+        prefixes_to_process = [prefix]
+        # Set to track prefixes that have been processed or are in progress
+        processed_prefixes = set()
+        
+        # Process all prefixes
+        while prefixes_to_process:
+            # Take a batch of prefixes to process based on available concurrency
+            current_batch = []
+            for _ in range(min(concurrency, len(prefixes_to_process))):
+                if not prefixes_to_process:
+                    break
+                current_prefix = prefixes_to_process.pop(0)
+                if current_prefix not in processed_prefixes:
+                    current_batch.append(current_prefix)
+                    processed_prefixes.add(current_prefix)
+            
+            if not current_batch:
+                break
+                
+            # Create tasks for all prefixes in the batch
+            tasks = [list_prefix(p) for p in current_batch]
+            
+            # Wait for all tasks to complete
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Process results
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning(f"Error in S3 listing: {result}")
+                    continue
+                    
+                # Yield objects from this prefix
+                if result['objects']:
+                    yield result['objects']
+                
+                # Add new prefixes to the queue
+                for new_prefix in result['common_prefixes']:
+                    if new_prefix not in processed_prefixes:
+                        prefixes_to_process.append(new_prefix)
     
     
     @staticmethod
@@ -129,7 +212,7 @@ class FileUtils:
         """Recursively iterate through all files in a directory.
         
         This is a replacement for the non-existent riterdir method in UPath.
-        Uses optimized path for S3 with direct aiobotocore calls.
+        Uses optimized path for S3 with parallel async aiobotocore calls.
         
         Args:
             path: The UPath directory to recursively iterate through
@@ -139,13 +222,13 @@ class FileUtils:
         """
         # Special optimized path for S3
         if path.protocol == 's3':
-            logger.info(f"Using optimized S3 listing for {path}")
+            logger.info(f"Using optimized parallel async S3 listing for {path}")
             # Parse the S3 path to get bucket and prefix
             bucket, prefix = FileUtils.parse_s3_path(path)
             
-            # Use aiobotocore to list objects directly in a paginated manner
-            # This allows for responsive UI updates during listing
-            async for page_keys in FileUtils.list_s3_objects_paginated(bucket, prefix):
+            # Use concurrent async listing for S3 paths
+            # This significantly improves performance by exploring directories in parallel
+            async for page_keys in FileUtils.list_s3_objects_parallel_async(bucket, prefix):
                 # Create S3Path objects for each key in the current page
                 for key in page_keys:
                     yield UPath(f"s3://{bucket}/{key}")
