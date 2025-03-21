@@ -144,11 +144,13 @@ class FileUtils:
             # Semaphore to limit concurrency
             sem = asyncio.Semaphore(concurrency)
             
-            # Process each prefix using the paginated method
+            # Process each prefix using the paginated method - getting ALL keys
             async def process_prefix(current_prefix):
                 async with sem:
+                    all_keys = []
                     async for keys in FileUtils.list_s3_objects_paginated(bucket, current_prefix):
-                        return keys
+                        all_keys.extend(keys)
+                    return all_keys
             
             # Process prefixes in smaller batches for better responsiveness
             for i in range(0, len(top_level_prefixes), concurrency):
