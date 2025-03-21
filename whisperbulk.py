@@ -22,8 +22,10 @@ from tqdm import tqdm
 from upath import UPath
 
 # Constants
-AUDIO_EXTENSIONS = (".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm")
-DERIVATIVE_FORMATS = ["txt", "srt"]
+AUDIO_EXTENSIONS = ("mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm")
+DERIVATIVE_FORMATS = ("txt", "srt")
+PROGRESS_BAR_WIDTH = 75
+DEFAULT_MODEL = "Systran/faster-whisper-medium"
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -45,6 +47,30 @@ logger = logging.getLogger("whisperbulk")
 openai_client = AsyncOpenAI()
 
 
+class FileUtils:
+    """Static utility methods for file operations."""
+    
+    @staticmethod
+    def get_extension(path: UPath) -> str:
+        """Get the file extension without the leading period."""
+        return path.suffix.lower().lstrip('.')
+    
+    @staticmethod
+    def is_audio_file(path: UPath) -> bool:
+        """Check if a file is a supported audio format."""
+        suffix = FileUtils.get_extension(path)
+        return suffix in AUDIO_EXTENSIONS
+    
+    @staticmethod
+    def is_output_file(path: UPath, output_files: Dict[str, Set[UPath]]) -> bool:
+        """Check if a file is a supported output format and add it to the output files dictionary."""
+        suffix = FileUtils.get_extension(path)
+        if suffix == "json" or suffix in DERIVATIVE_FORMATS:
+            output_files[suffix].add(path)
+            return True
+        return False
+
+
 class FileManager:
     """
     Manages file discovery and tracking for both input and output paths.
@@ -56,7 +82,7 @@ class FileManager:
         Initialize the FileManager with input and output paths.
         
         Args:
-            input_path: The input directory or file path
+            input_path: The input directory path
             output_path: The output directory path
             recursive: Whether to search subdirectories
         """
@@ -72,6 +98,50 @@ class FileManager:
         self._scan_input_files()
         self._scan_output_files()
     
+    def _list_files_recursive(self, directory: UPath, file_filter=None, progress=None):
+        """
+        Recursively list files in a directory using iterdir() instead of rglob().
+        
+        Args:
+            directory: The directory to search
+            file_filter: Optional function to filter files (returns True to include)
+            progress: Optional progress bar to update
+            
+        Returns:
+            List of UPath objects for matching files
+        """
+        result = []
+        
+        # Stack for directories to process (depth-first traversal)
+        dirs_to_process = [directory]
+        
+        while dirs_to_process:
+            current_dir = dirs_to_process.pop()
+            
+            try:
+                # Use iterdir() to list all items in the current directory
+                for item in current_dir.iterdir():
+                    try:
+                        # If it's a file and passes the filter, add it to results
+                        if item.is_file():
+                            if file_filter is None or file_filter(item):
+                                result.append(item)
+                                if progress:
+                                    progress.update(1)
+                                    progress.refresh()  # Manually refresh the progress bar
+                        
+                        # If it's a directory and recursive is enabled, add to processing stack
+                        elif item.is_dir() and self.recursive:
+                            dirs_to_process.append(item)
+                    
+                    except Exception as e:
+                        logger.warning(f"Error processing {item}: {e}")
+            
+            except Exception as e:
+                logger.warning(f"Error accessing directory {current_dir}: {e}")
+        
+        return result
+    
     def _scan_input_files(self):
         """Scan and cache all audio files in the input path."""
         logger.info(f"Scanning input path for audio files: {self.input_path}")
@@ -80,34 +150,23 @@ class FileManager:
         progress = tqdm(
             desc="Discovering audio files",
             unit="files",
-            ncols=70,
+            ncols=PROGRESS_BAR_WIDTH,
             leave=True
         )
         
-        # If it's a single file, just check if it's audio and add it
-        if self.input_path.is_file():
-            if is_audio_file(self.input_path):
-                self.input_files.append(self.input_path)
-                progress.update(1)
-            progress.close()
-            return
+        # Use our helper function to list all audio files
+        self.input_files = self._list_files_recursive(
+            self.input_path,
+            file_filter=FileUtils.is_audio_file,
+            progress=progress
+        )
         
-        # For directories, use globbing with UPath
-        # Use the appropriate glob method based on recursive flag
-        if self.recursive:
-            # Use rglob for recursive search
-            for ext in AUDIO_EXTENSIONS:
-                pattern = f"*{ext}"
-                for file_path in self.input_path.rglob(pattern):
-                    self.input_files.append(file_path)
-                    progress.update(1)
-        else:
-            # Use glob for non-recursive search
-            for ext in AUDIO_EXTENSIONS:
-                pattern = f"*{ext}"
-                for file_path in self.input_path.glob(pattern):
-                    self.input_files.append(file_path)
-                    progress.update(1)
+        # Update the progress total to match the actual count
+        progress.total = len(self.input_files)
+        # Set to the correct number of files found
+        progress.n = len(self.input_files)
+        # Ensure the progress bar is refreshed with the final count
+        progress.refresh()
         
         # Close the progress bar
         progress.close()
@@ -129,7 +188,7 @@ class FileManager:
             self.output_files[fmt] = set()
         
         logger.info(f"Scanning existing output files in {self.output_path}")
-        progress = tqdm(desc="Scanning existing output files", unit="files", ncols=70, leave=True)
+        progress = tqdm(desc="Scanning existing output files", unit="files", ncols=PROGRESS_BAR_WIDTH, leave=True)
         
         # Skip if output directory doesn't exist yet
         if not self.output_path.exists():
@@ -138,21 +197,29 @@ class FileManager:
             return
         
         try:
-            # Scan for all supported formats
-            for fmt in ["json"] + DERIVATIVE_FORMATS:
-                # Use glob to find files with the specific extension
-                pattern = f"*.{fmt}"
-                if self.output_path.is_dir():
-                    # Recursively find all files with the given extension
-                    for file_path in self.output_path.rglob(pattern):
-                        self.output_files[fmt].add(file_path)
-                        progress.update(1)
+            # Create a closure to capture self.output_files for the filter function
+            def output_file_filter(path):
+                return FileUtils.is_output_file(path, self.output_files)
+            
+            # Use our helper function to list all output files
+            self._list_files_recursive(
+                self.output_path,
+                file_filter=output_file_filter,
+                progress=progress
+            )
         except Exception as e:
             logger.warning(f"Error scanning output directory {self.output_path}: {e}")
         
         # Count total files found
         total_files = sum(len(files) for files in self.output_files.values())
         
+        # Update the progress bar with the correct total
+        progress.total = total_files
+        progress.n = total_files
+        # Ensure the progress bar is refreshed with the final count
+        progress.refresh()
+        
+        # Close the progress bar
         progress.close()
         logger.info(f"Found {total_files} existing output files in {self.output_path}")
     
@@ -265,6 +332,12 @@ class FileManager:
                 files_to_process.append((file_path, needs_transcription, missing_derivatives))
             
             check_progress.update(1)
+            check_progress.refresh()  # Manually refresh the progress bar
+        
+        # Ensure the progress bar shows the correct total number of files checked
+        check_progress.total = len(self.input_files)
+        check_progress.n = len(self.input_files)
+        check_progress.refresh()
         
         # Close progress bar
         check_progress.close()
@@ -272,32 +345,38 @@ class FileManager:
         return files_to_process
 
 
-
-@tenacity.retry(
-    retry=tenacity.retry_if_exception_type(Exception),
-    wait=tenacity.wait_exponential(multiplier=1, min=4, max=60),
-    stop=tenacity.stop_after_attempt(5),
-    before_sleep=lambda retry_state: logger.warning(
-        f"Retrying {retry_state.attempt_number}/5 after exception: "
-        f"{retry_state.outcome.exception() if retry_state.outcome else 'Unknown error'}"
-    ),
-)
-async def transcribe_file(file_path: UPath, model: str) -> Dict:
-    """Transcribe a single audio file using the specified Whisper model with retry logic."""
-    logger.info(f"Transcribing {file_path} with model {model}")
+class TranscriptionService:
+    """Handles transcription of audio files using Whisper models."""
     
-    result = None
-    with open(file_path, "rb") as audio_file:
-        # Use the temp file directly for transcription
-        response = await openai_client.audio.transcriptions.create(
-            file=audio_file, 
-            model=model,
-            response_format="verbose_json"
-        )
+    def __init__(self, client=None):
+        """Initialize the transcription service with an optional client."""
+        self.client = client or openai_client
+    
+    @tenacity.retry(
+        retry=tenacity.retry_if_exception_type(Exception),
+        wait=tenacity.wait_exponential(multiplier=1, min=4, max=60),
+        stop=tenacity.stop_after_attempt(5),
+        before_sleep=lambda retry_state: logger.warning(
+            f"Retrying {retry_state.attempt_number}/5 after exception: "
+            f"{retry_state.outcome.exception() if retry_state.outcome else 'Unknown error'}"
+        ),
+    )
+    async def transcribe_file(self, file_path: UPath, model: str) -> Dict:
+        """Transcribe a single audio file using the specified Whisper model with retry logic."""
+        logger.info(f"Transcribing {file_path} with model {model}")
         
-        result = response.model_dump() if hasattr(response, "model_dump") else response
-    
-    return result
+        result = None
+        with open(file_path, "rb") as audio_file:
+            # Use the temp file directly for transcription
+            response = await self.client.audio.transcriptions.create(
+                file=audio_file, 
+                model=model,
+                response_format="verbose_json"
+            )
+            
+            result = response.model_dump() if hasattr(response, "model_dump") else response
+        
+        return result
 
 
 class DerivativeConverter:
@@ -343,242 +422,248 @@ class DerivativeConverter:
         return srt.compose(subtitle_entries)
 
 
-async def save_json_transcription(
-    transcription_data: Dict,
-    output_path: UPath
-) -> None:
-    """Save transcription results as JSON."""
-    # Format as JSON string
-    content = json.dumps(transcription_data, indent=2, ensure_ascii=False)
+class FileOutputService:
+    """Handles saving transcription data to files in various formats."""
     
-    # Ensure directory exists
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Write the file using the appropriate method based on protocol
-    if output_path.protocol == "file":
-        # Use aiofiles for local files to get async IO benefits
-        async with aiofiles.open(str(output_path), 'w', encoding='utf-8') as f:
-            await f.write(content)
-    else:
-        # For cloud paths, use UPath's built-in methods
-        output_path.write_text(content)
-    
-    logger.info(f"Saved JSON transcription to {output_path}")
-
-
-async def save_derivative(
-    transcription_data: Dict,
-    output_path: UPath,
-    format_name: Literal["txt", "srt"]
-) -> None:
-    """Save transcription results in a derivative format (txt or srt)."""
-    # Convert to the requested format
-    if format_name == "txt":
-        content = DerivativeConverter.to_text(transcription_data)
-    elif format_name == "srt":
-        content = DerivativeConverter.to_srt(transcription_data)
-    else:
-        raise ValueError(f"Unsupported derivative format: {format_name}")
-    
-    # Ensure directory exists
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Write the file using the appropriate method based on protocol
-    if output_path.protocol == "file":
-        # Use aiofiles for local files to get async IO benefits
-        async with aiofiles.open(str(output_path), 'w', encoding='utf-8') as f:
-            await f.write(content)
-    else:
-        # For cloud paths, use UPath's built-in methods
-        output_path.write_text(content)
-    
-    logger.info(f"Saved {format_name.upper()} derivative to {output_path}")
-
-
-
-async def process_file(
-    file_path: UPath,
-    output_dir: UPath,
-    input_dir: UPath,
-    model: str = "Systran/faster-whisper-medium",
-    derivatives: Optional[List[Literal["txt", "srt"]]] = None,
-    file_manager: FileManager = None
-) -> None:
-    """
-    Process a single file: transcribe to JSON and optionally create derivative formats.
-    
-    Args:
-        file_path: Path to the audio file to process
-        output_dir: Directory to save outputs
-        input_dir: Input directory for relative path calculation
-        model: Whisper model to use for transcription
-        derivatives: Derivative formats to generate (txt, srt)
-        file_manager: FileManager instance to use for path generation (required)
-    """
-    try:
-        logger.info(f"Processing file: {file_path}")
+    @staticmethod
+    async def save_json_transcription(transcription_data: Dict, output_path: UPath) -> None:
+        """Save transcription results as JSON."""
+        # Format as JSON string
+        content = json.dumps(transcription_data, indent=2, ensure_ascii=False)
         
-        # Set empty list if derivatives is None
-        derivatives_to_process = derivatives or []
+        # Ensure directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Get the JSON output path
-        json_path = file_manager.get_output_path(file_path, "json")
-            
-        # Check if JSON file exists
-        json_exists = json_path.exists()
-        
-        # Initialize results and tasks
-        transcription_data = None
-        save_tasks = []
-        
-        # STEP 1: Try to use existing JSON if possible
-        if json_exists:
-            logger.info(f"Found existing JSON file: {json_path}")
-            # Load and parse the JSON file
-            try:
-                # Read the file using the appropriate method based on protocol
-                if json_path.protocol == "file":
-                    # Use aiofiles for local files to get async IO benefits
-                    async with aiofiles.open(str(json_path), 'rb') as f:
-                        json_content = await f.read()
-                else:
-                    # For cloud paths, use UPath's built-in methods
-                    json_content = json_path.read_bytes()
-                
-                json_text = json_content.decode('utf-8')
-                transcription_data = json.loads(json_text)
-            except json.JSONDecodeError as e:
-                logger.error(f"Error parsing existing JSON file {json_path}: {e}")
-                transcription_data = None  # Force re-transcription
-        
-        # STEP 2: If no valid JSON exists, perform transcription
-        if not json_exists or transcription_data is None:
-            logger.info(f"Transcribing: {file_path}")
-            transcription_data = await transcribe_file(file_path, model)
-            
-            # Save JSON result
-            save_tasks.append(save_json_transcription(
-                transcription_data, 
-                json_path
-            ))
-        
-        # STEP 3: Create derivative formats if requested
-        for fmt in derivatives_to_process:
-            # Get the output path for this derivative format
-            output_path = file_manager.get_output_path(file_path, fmt)
-            
-            # Check if this derivative already exists
-            if not output_path.exists():
-                logger.info(f"Creating {fmt} derivative: {output_path}")
-                save_tasks.append(save_derivative(
-                    transcription_data,
-                    output_path,
-                    fmt
-                ))
-        
-        # Run all save tasks concurrently for better performance
-        if save_tasks:
-            await asyncio.gather(*save_tasks)
-            logger.info(f"Completed processing {file_path}")
+        # Write the file using the appropriate method based on protocol
+        if output_path.protocol == "file":
+            # Use aiofiles for local files to get async IO benefits
+            async with aiofiles.open(str(output_path), 'w', encoding='utf-8') as f:
+                await f.write(content)
         else:
-            logger.info(f"No new outputs to generate for {file_path}")
-
-    except Exception as e:
-        logger.error(f"Error processing {file_path}: {e}")
-        raise
-
-
-
-
-async def process_files(
-    file_manager: FileManager,
-    concurrency: int = 5,
-    model: str = "Systran/faster-whisper-medium",
-    derivatives: Optional[List[Literal["txt", "srt"]]] = None,
-    force: bool = False
-) -> None:
-    """
-    Process multiple files concurrently, skipping files that already have outputs unless force=True.
-    
-    Args:
-        file_manager: FileManager instance with input and output files
-        concurrency: Number of concurrent transcription jobs
-        model: Whisper model to use for transcription
-        derivatives: Derivative formats to generate
-        force: If True, process all files regardless of existing outputs
-    """
-    # Ensure derivatives is a list or None
-    validated_derivatives = derivatives or []
-    
-    # Validate derivatives against supported list
-    for fmt in validated_derivatives.copy():
-        if fmt not in DERIVATIVE_FORMATS:
-            logger.warning(f"Ignoring unsupported derivative format: {fmt}")
-            validated_derivatives.remove(fmt)
-    
-    # Get files that need processing using the FileManager
-    processing_info = file_manager.get_files_needing_processing(validated_derivatives, force)
-    
-    # Extract just the file paths for logging
-    files_to_process = [file_info[0] for file_info in processing_info]
-    
-    # If nothing to process, we're done
-    if not files_to_process:
-        logger.info("No files need processing - all output files already exist")
-        return
+            # For cloud paths, use UPath's built-in methods
+            output_path.write_text(content)
         
-    logger.info(f"Processing {len(files_to_process)} of {len(file_manager.get_audio_files())} files "
-               f"(skipping {len(file_manager.get_audio_files()) - len(files_to_process)} with existing outputs)")
+        logger.info(f"Saved JSON transcription to {output_path}")
     
-    # Step 3: Process files concurrently with semaphore to limit API calls
-    semaphore = asyncio.Semaphore(concurrency)
+    @staticmethod
+    async def save_derivative(
+        transcription_data: Dict,
+        output_path: UPath,
+        format_name: Literal["txt", "srt"]
+    ) -> None:
+        """Save transcription results in a derivative format (txt or srt)."""
+        # Convert to the requested format
+        if format_name == "txt":
+            content = DerivativeConverter.to_text(transcription_data)
+        elif format_name == "srt":
+            content = DerivativeConverter.to_srt(transcription_data)
+        else:
+            raise ValueError(f"Unsupported derivative format: {format_name}")
+        
+        # Ensure directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Write the file using the appropriate method based on protocol
+        if output_path.protocol == "file":
+            # Use aiofiles for local files to get async IO benefits
+            async with aiofiles.open(str(output_path), 'w', encoding='utf-8') as f:
+                await f.write(content)
+        else:
+            # For cloud paths, use UPath's built-in methods
+            output_path.write_text(content)
+        
+        logger.info(f"Saved {format_name.upper()} derivative to {output_path}")
 
-    async def _process_with_semaphore(file_path, needs_transcription, missing_derivatives):
-        async with semaphore:
-            # If we don't need to transcribe or generate derivatives, skip this file
-            if not needs_transcription and not missing_derivatives:
-                return
-                
-            # Process the file with the required derivatives
-            return await process_file(
-                file_path, 
-                file_manager.output_path, 
-                file_manager.input_path,
-                model, 
-                list(missing_derivatives) if not needs_transcription else validated_derivatives,
-                file_manager=file_manager  # Pass the FileManager to use its methods
-            )
 
-    # Set up progress bar for processing
-    progress = tqdm(
-        total=len(files_to_process),
-        desc="Transcribing files",
-        position=0,
-        smoothing=0.0,
-        ncols=70,
-        leave=True
-    )
+class TranscriptionProcessor:
+    """
+    Orchestrates the process of transcribing files and generating derivative formats.
+    """
     
-    async def process_and_update(file_info):
-        file_path, needs_transcription, missing_derivatives = file_info
+    def __init__(
+        self, 
+        file_manager: FileManager,
+        transcription_service: TranscriptionService = None,
+        output_service: FileOutputService = None
+    ):
+        """Initialize the processor with needed services."""
+        self.file_manager = file_manager
+        self.transcription_service = transcription_service or TranscriptionService()
+        self.output_service = output_service or FileOutputService()
+    
+    async def process_file(
+        self,
+        file_path: UPath,
+        model: str = DEFAULT_MODEL,
+        derivatives: Optional[List[Literal["txt", "srt"]]] = None
+    ) -> None:
+        """
+        Process a single file: transcribe to JSON and optionally create derivative formats.
+        
+        Args:
+            file_path: Path to the audio file to process
+            model: Whisper model to use for transcription
+            derivatives: Derivative formats to generate (txt, srt)
+        """
         try:
-            await _process_with_semaphore(file_path, needs_transcription, missing_derivatives)
-        except Exception as e:
-            logger.error(f"Failed to process {file_path}: {e}")
-        finally:
-            # Always update progress, even if file processing fails
-            progress.update(1)
+            logger.info(f"Processing file: {file_path}")
+            
+            # Set empty list if derivatives is None
+            derivatives_to_process = derivatives or []
+            
+            # Get the JSON output path
+            json_path = self.file_manager.get_output_path(file_path, "json")
+                
+            # Check if JSON file exists
+            json_exists = json_path.exists()
+            
+            # Initialize results and tasks
+            transcription_data = None
+            save_tasks = []
+            
+            # STEP 1: Try to use existing JSON if possible
+            if json_exists:
+                logger.info(f"Found existing JSON file: {json_path}")
+                # Load and parse the JSON file
+                try:
+                    # Read the file using the appropriate method based on protocol
+                    if json_path.protocol == "file":
+                        # Use aiofiles for local files to get async IO benefits
+                        async with aiofiles.open(str(json_path), 'rb') as f:
+                            json_content = await f.read()
+                    else:
+                        # For cloud paths, use UPath's built-in methods
+                        json_content = json_path.read_bytes()
+                    
+                    json_text = json_content.decode('utf-8')
+                    transcription_data = json.loads(json_text)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Error parsing existing JSON file {json_path}: {e}")
+                    transcription_data = None  # Force re-transcription
+            
+            # STEP 2: If no valid JSON exists, perform transcription
+            if not json_exists or transcription_data is None:
+                logger.info(f"Transcribing: {file_path}")
+                transcription_data = await self.transcription_service.transcribe_file(file_path, model)
+                
+                # Save JSON result
+                save_tasks.append(self.output_service.save_json_transcription(
+                    transcription_data, 
+                    json_path
+                ))
+            
+            # STEP 3: Create derivative formats if requested
+            for fmt in derivatives_to_process:
+                # Get the output path for this derivative format
+                output_path = self.file_manager.get_output_path(file_path, fmt)
+                
+                # Check if this derivative already exists
+                if not output_path.exists():
+                    logger.info(f"Creating {fmt} derivative: {output_path}")
+                    save_tasks.append(self.output_service.save_derivative(
+                        transcription_data,
+                        output_path,
+                        fmt
+                    ))
+            
+            # Run all save tasks concurrently for better performance
+            if save_tasks:
+                await asyncio.gather(*save_tasks)
+                logger.info(f"Completed processing {file_path}")
+            else:
+                logger.info(f"No new outputs to generate for {file_path}")
     
-    # Create tasks for all files and process them concurrently
-    tasks = [process_and_update(info) for info in processing_info]
-    await asyncio.gather(*tasks, return_exceptions=True)
-    progress.close()
-
-
-def is_audio_file(path: UPath) -> bool:
-    """Check if a file is a supported audio format."""
-    return path.suffix.lower() in AUDIO_EXTENSIONS
-
+        except Exception as e:
+            logger.error(f"Error processing {file_path}: {e}")
+            raise
+    
+    async def process_files(
+        self,
+        concurrency: int = 5,
+        model: str = DEFAULT_MODEL,
+        derivatives: Optional[List[Literal["txt", "srt"]]] = None,
+        force: bool = False
+    ) -> None:
+        """
+        Process multiple files concurrently, skipping files that already have outputs unless force=True.
+        
+        Args:
+            concurrency: Number of concurrent transcription jobs
+            model: Whisper model to use for transcription
+            derivatives: Derivative formats to generate
+            force: If True, process all files regardless of existing outputs
+        """
+        # Ensure derivatives is a list or None
+        validated_derivatives = derivatives or []
+        
+        # Validate derivatives against supported list
+        for fmt in validated_derivatives.copy():
+            if fmt not in DERIVATIVE_FORMATS:
+                logger.warning(f"Ignoring unsupported derivative format: {fmt}")
+                validated_derivatives.remove(fmt)
+        
+        # Get files that need processing using the FileManager
+        processing_info = self.file_manager.get_files_needing_processing(validated_derivatives, force)
+        
+        # Extract just the file paths for logging
+        files_to_process = [file_info[0] for file_info in processing_info]
+        
+        # If nothing to process, we're done
+        if not files_to_process:
+            logger.info("No files need processing - all output files already exist")
+            return
+            
+        logger.info(
+            f"Processing {len(files_to_process)} of {len(self.file_manager.get_audio_files())} files "
+            f"(skipping {len(self.file_manager.get_audio_files()) - len(files_to_process)} with existing outputs)"
+        )
+        
+        # Step 3: Process files concurrently with semaphore to limit API calls
+        semaphore = asyncio.Semaphore(concurrency)
+        
+        async def _process_with_semaphore(file_path, needs_transcription, missing_derivatives):
+            async with semaphore:
+                # If we don't need to transcribe or generate derivatives, skip this file
+                if not needs_transcription and not missing_derivatives:
+                    return
+                    
+                # Process the file with the required derivatives
+                return await self.process_file(
+                    file_path, 
+                    model, 
+                    list(missing_derivatives) if not needs_transcription else validated_derivatives
+                )
+        
+        # Set up progress bar for processing
+        progress = tqdm(
+            total=len(files_to_process),
+            desc="Transcribing files",
+            position=0,
+            smoothing=0.0,
+            ncols=PROGRESS_BAR_WIDTH,
+            leave=True
+        )
+        
+        async def process_and_update(file_info):
+            file_path, needs_transcription, missing_derivatives = file_info
+            try:
+                await _process_with_semaphore(file_path, needs_transcription, missing_derivatives)
+            except Exception as e:
+                logger.error(f"Failed to process {file_path}: {e}")
+            finally:
+                # Always update progress, even if file processing fails
+                progress.update(1)
+                progress.refresh()  # Manually refresh the progress bar
+        
+        # Create tasks for all files and process them concurrently
+        tasks = [process_and_update(info) for info in processing_info]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Make sure progress bar shows the correct final count
+        progress.total = len(files_to_process)
+        progress.n = len(files_to_process)
+        progress.refresh()
+        progress.close()
 
 
 @click.command()
@@ -601,7 +686,7 @@ def is_audio_file(path: UPath) -> bool:
     help="Path to log file (default: logs/whisperbulk.log)"
 )
 @click.option(
-    "--model", "-m", default="Systran/faster-whisper-medium",
+    "--model", "-m", default=DEFAULT_MODEL,
     help="Model to use for transcription"
 )
 @click.option(
@@ -616,7 +701,7 @@ def is_audio_file(path: UPath) -> bool:
 def main(input_path, output_path, concurrency, recursive, verbose, log_file, model, derivative, force):
     """Bulk transcribe audio files using Whisper models.
 
-    INPUT_PATH is the source directory or file (or s3:// URI).
+    INPUT_PATH is the source directory (or s3:// URI).
     OUTPUT_PATH is the destination directory (or s3:// URI) for transcriptions.
 
     Supports local paths and S3 URIs (s3://bucket/path).
@@ -644,6 +729,12 @@ def main(input_path, output_path, concurrency, recursive, verbose, log_file, mod
     # Convert input and output paths to UPath objects
     input_path_obj = UPath(input_path)
     output_path_obj = UPath(output_path) if output_path else None
+    
+    # Validate that input path is a directory
+    if not input_path_obj.is_dir():
+        print(f"Error: Input path '{input_path}' must be a directory.")
+        logger.error(f"Input path '{input_path}' is not a directory")
+        sys.exit(1)
     
     # Configure logging
     if log_file:
@@ -691,10 +782,10 @@ def main(input_path, output_path, concurrency, recursive, verbose, log_file, mod
         # Log resumable mode (unless force is enabled)
         if not force:
             logger.info("Running in resumable mode - will skip files that already have outputs")
-            
-        # Process the files using the FileManager
-        await process_files(
-            file_manager,
+        
+        # Create processor and process the files
+        processor = TranscriptionProcessor(file_manager)    
+        await processor.process_files(
             concurrency, 
             model, 
             derivatives_list, 
