@@ -83,13 +83,9 @@ class FileUtils:
             UPath objects for all files found recursively
         """
         # Start with the contents of the directory
-        for item in path.iterdir():
-            # If it's a directory, recursively iterate through its contents
-            if item.is_dir():
-                yield from FileUtils.riterdir(item)
-            # If it's a file, yield it
-            else:
-                yield item
+        fs = path.fs
+        for file_path in fs.find(str(path), maxdepth=None, withdirs=False):
+            yield UPath(file_path)
 
 
 class FileManager:
