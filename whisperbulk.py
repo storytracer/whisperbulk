@@ -101,87 +101,66 @@ class FileUtils:
                     yield page_keys
                     
     @staticmethod
-    async def list_s3_objects_parallel_async(bucket, prefix, delimiter='/', concurrency=20):
-        """List all objects in an S3 bucket with parallel async processing.
+    async def list_s3_objects_simple_parallel(bucket, prefix, delimiter='/', concurrency=10):
+        """List all objects in an S3 bucket using a simplified parallel approach.
         
-        This method uses async concurrency to explore directories (common prefixes)
-        in parallel, which can significantly improve performance for buckets with
-        many subdirectories.
+        This method first lists the top-level prefixes, then processes them concurrently.
         
         Args:
             bucket: The S3 bucket name
             prefix: The prefix to filter objects by
             delimiter: The delimiter to use (default: '/')
-            concurrency: Maximum number of concurrent tasks (default: 20)
+            concurrency: Maximum number of concurrent tasks (default: 10)
             
         Yields:
             Lists of S3 object keys found in batches
         """
-        # Create a semaphore to limit concurrency
-        sem = asyncio.Semaphore(concurrency)
-        
-        # Function to list objects and prefixes at a specific prefix
-        async def list_prefix(current_prefix):
-            async with sem:
-                session = get_session()
-                async with session.create_client('s3') as client:
-                    paginator = client.get_paginator('list_objects_v2')
-                    objects = []
-                    common_prefixes = []
-                    
-                    async for page in paginator.paginate(Bucket=bucket, Prefix=current_prefix, Delimiter=delimiter):
-                        if 'Contents' in page:
-                            for obj in page['Contents']:
-                                # Skip directories (objects ending with '/')
-                                if not obj['Key'].endswith('/'):
-                                    objects.append(obj['Key'])
-                        
-                        if 'CommonPrefixes' in page:
-                            for common_prefix in page['CommonPrefixes']:
-                                common_prefixes.append(common_prefix['Prefix'])
-                    
-                    return {'objects': objects, 'common_prefixes': common_prefixes}
-        
-        # Queue of prefixes to process
-        prefixes_to_process = [prefix]
-        # Set to track prefixes that have been processed or are in progress
-        processed_prefixes = set()
-        
-        # Process all prefixes
-        while prefixes_to_process:
-            # Take a batch of prefixes to process based on available concurrency
-            current_batch = []
-            for _ in range(min(concurrency, len(prefixes_to_process))):
-                if not prefixes_to_process:
-                    break
-                current_prefix = prefixes_to_process.pop(0)
-                if current_prefix not in processed_prefixes:
-                    current_batch.append(current_prefix)
-                    processed_prefixes.add(current_prefix)
+        # First, get all the top-level prefixes
+        session = get_session()
+        async with session.create_client('s3') as client:
+            paginator = client.get_paginator('list_objects_v2')
+            top_level_prefixes = [prefix]  # Start with the input prefix
             
-            if not current_batch:
-                break
+            # Get the top-level directories/prefixes
+            async for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter=delimiter):
+                # Process objects directly under the root prefix
+                if 'Contents' in page:
+                    page_keys = []
+                    for obj in page['Contents']:
+                        if not obj['Key'].endswith('/'):
+                            page_keys.append(obj['Key'])
+                    if page_keys:
+                        yield page_keys
                 
-            # Create tasks for all prefixes in the batch
-            tasks = [list_prefix(p) for p in current_batch]
+                # Collect additional top-level prefixes to process in parallel
+                if 'CommonPrefixes' in page:
+                    for common_prefix in page['CommonPrefixes']:
+                        top_level_prefixes.append(common_prefix['Prefix'])
+        
+        # Process all prefixes in parallel (if we have more than one)
+        if len(top_level_prefixes) > 1:
+            logger.info(f"Processing {len(top_level_prefixes)} prefixes in parallel with concurrency {concurrency}")
             
-            # Wait for all tasks to complete
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Semaphore to limit concurrency
+            sem = asyncio.Semaphore(concurrency)
             
-            # Process results
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.warning(f"Error in S3 listing: {result}")
-                    continue
-                    
-                # Yield objects from this prefix
-                if result['objects']:
-                    yield result['objects']
+            # Process each prefix using the paginated method
+            async def process_prefix(current_prefix):
+                async with sem:
+                    async for keys in FileUtils.list_s3_objects_paginated(bucket, current_prefix):
+                        return keys
+            
+            # Process prefixes in smaller batches for better responsiveness
+            for i in range(0, len(top_level_prefixes), concurrency):
+                batch = top_level_prefixes[i:i+concurrency]
+                tasks = [process_prefix(p) for p in batch]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
                 
-                # Add new prefixes to the queue
-                for new_prefix in result['common_prefixes']:
-                    if new_prefix not in processed_prefixes:
-                        prefixes_to_process.append(new_prefix)
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.warning(f"Error in S3 listing: {result}")
+                    elif result:  # If we got keys
+                        yield result
     
     
     @staticmethod
@@ -212,7 +191,7 @@ class FileUtils:
         """Recursively iterate through all files in a directory.
         
         This is a replacement for the non-existent riterdir method in UPath.
-        Uses optimized path for S3 with parallel async aiobotocore calls.
+        Uses optimized path for S3 with simple parallel async aiobotocore calls.
         
         Args:
             path: The UPath directory to recursively iterate through
@@ -222,13 +201,12 @@ class FileUtils:
         """
         # Special optimized path for S3
         if path.protocol == 's3':
-            logger.info(f"Using optimized parallel async S3 listing for {path}")
+            logger.info(f"Using optimized simple parallel S3 listing for {path}")
             # Parse the S3 path to get bucket and prefix
             bucket, prefix = FileUtils.parse_s3_path(path)
             
-            # Use concurrent async listing for S3 paths
-            # This significantly improves performance by exploring directories in parallel
-            async for page_keys in FileUtils.list_s3_objects_parallel_async(bucket, prefix):
+            # Use simplified parallel listing for better progress bar responsiveness
+            async for page_keys in FileUtils.list_s3_objects_simple_parallel(bucket, prefix, concurrency=10):
                 # Create S3Path objects for each key in the current page
                 for key in page_keys:
                     yield UPath(f"s3://{bucket}/{key}")
