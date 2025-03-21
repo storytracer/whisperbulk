@@ -73,29 +73,32 @@ class FileUtils:
         return False
     
     @staticmethod
-    async def list_s3_objects(bucket, prefix):
+    async def list_s3_objects_paginated(bucket, prefix):
         """List all objects in an S3 bucket with the given prefix using aiobotocore.
+        Returns results page by page for responsive UI updates.
         
         Args:
             bucket: The S3 bucket name
             prefix: The prefix to filter objects by
             
-        Returns:
-            List of S3 object keys
+        Yields:
+            Lists of S3 object keys, one list per page of results
         """
         session = get_session()
         async with session.create_client('s3') as client:
             paginator = client.get_paginator('list_objects_v2')
-            object_keys = []
             
+            # Process each page separately to allow for progress updates
             async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                page_keys = []
                 if 'Contents' in page:
                     for obj in page['Contents']:
                         # Skip directories (objects ending with '/')
                         if not obj['Key'].endswith('/'):
-                            object_keys.append(obj['Key'])
-            
-            return object_keys
+                            page_keys.append(obj['Key'])
+                
+                if page_keys:
+                    yield page_keys
     
     
     @staticmethod
@@ -140,12 +143,12 @@ class FileUtils:
             # Parse the S3 path to get bucket and prefix
             bucket, prefix = FileUtils.parse_s3_path(path)
             
-            # Use aiobotocore to list objects directly
-            object_keys = await FileUtils.list_s3_objects(bucket, prefix)
-            
-            # Create S3Path objects using UPath
-            for key in object_keys:
-                yield UPath(f"s3://{bucket}/{key}")
+            # Use aiobotocore to list objects directly in a paginated manner
+            # This allows for responsive UI updates during listing
+            async for page_keys in FileUtils.list_s3_objects_paginated(bucket, prefix):
+                # Create S3Path objects for each key in the current page
+                for key in page_keys:
+                    yield UPath(f"s3://{bucket}/{key}")
         else:
             # For non-S3 paths, use the standard fsspec implementation
             fs = path.fs
