@@ -164,7 +164,7 @@ class FileUtils:
             
             # Process 20 prefixes at a time to avoid hitting S3 rate limits
             # but still keep things simple
-            chunk_size = 20
+            chunk_size = 8
             for i in range(0, len(tasks), chunk_size):
                 chunk = tasks[i:i+chunk_size]
                 results = await asyncio.gather(*chunk)
@@ -219,7 +219,7 @@ class FileUtils:
             bucket, prefix = FileUtils.parse_s3_path(path)
             
             # Use simplified parallel listing for better progress bar responsiveness
-            async for page_keys in FileUtils.list_s3_objects_simple_parallel(bucket, prefix, concurrency=10):
+            async for page_keys in FileUtils.list_s3_objects_simple_parallel(bucket, prefix):
                 # Create S3Path objects for each key in the current page
                 for key in page_keys:
                     yield UPath(f"s3://{bucket}/{key}")
