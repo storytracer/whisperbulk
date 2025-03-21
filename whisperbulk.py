@@ -101,125 +101,78 @@ class FileUtils:
                     yield page_keys
                     
     @staticmethod
-    async def list_s3_objects_simple_parallel(bucket, prefix, delimiter='/', concurrency=10):
-        """List all objects in an S3 bucket using a simplified parallel approach.
+    async def list_s3_objects_simple_parallel(bucket, prefix, delimiter='/'):
+        """Ultra-simple parallel listing of S3 objects.
         
-        This method:
-        1. Gets all top-level prefixes
-        2. Creates a queue of prefixes to process
-        3. Processes prefixes in parallel with a semaphore
-        4. Yields each page of results immediately to keep the progress bar responsive
+        Gets all prefixes and lists them all at once.
         
         Args:
             bucket: The S3 bucket name
             prefix: The prefix to filter objects by
             delimiter: The delimiter to use (default: '/')
-            concurrency: Maximum number of concurrent tasks (default: 10)
             
         Yields:
-            Lists of S3 object keys found in batches (page by page)
+            Lists of S3 object keys as soon as they're found
         """
-        # Step 1: Get all top-level prefixes first
-        top_level_prefixes = []
-        
-        # Create a session for the initial listing
+        # First, yield objects in the root prefix
         session = get_session()
         async with session.create_client('s3') as client:
             paginator = client.get_paginator('list_objects_v2')
             
-            # Process the root prefix first
+            # Find all prefixes first
+            all_prefixes = [prefix]  # Start with the root
+            
+            # List objects at the root prefix and collect sub-prefixes
             async for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter=delimiter):
-                # Yield files directly in the root prefix immediately
+                # Yield objects in the root prefix
                 if 'Contents' in page:
-                    page_keys = []
-                    for obj in page['Contents']:
-                        if not obj['Key'].endswith('/'):
-                            page_keys.append(obj['Key'])
-                    if page_keys:
-                        yield page_keys
-                
-                # Collect all top-level prefixes
+                    keys = [obj['Key'] for obj in page['Contents'] if not obj['Key'].endswith('/')]
+                    if keys:
+                        yield keys
+                        
+                # Collect prefixes for parallel processing
                 if 'CommonPrefixes' in page:
                     for common_prefix in page['CommonPrefixes']:
-                        top_level_prefixes.append(common_prefix['Prefix'])
-        
-        # If we have prefixes to process
-        if top_level_prefixes:
-            logger.info(f"Processing {len(top_level_prefixes)} top-level prefixes in parallel")
+                        all_prefixes.append(common_prefix['Prefix'])
             
-            # Step 2 & 3: Create a queue and process with a semaphore
-            queue = asyncio.Queue()
-            for p in top_level_prefixes:
-                await queue.put(p)
+            # Don't need to process further if we only have the root prefix
+            if len(all_prefixes) <= 1:
+                return
+                
+            logger.info(f"Found {len(all_prefixes)} prefixes to process")
             
-            # Create a semaphore to limit concurrency
-            sem = asyncio.Semaphore(concurrency)
-            
-            # Create a channel to communicate results back to the main task
-            results_queue = asyncio.Queue()
-            
-            # Process prefixes from the queue
-            async def worker():
-                while True:
-                    try:
-                        # Get a prefix from the queue
-                        current_prefix = await asyncio.wait_for(queue.get(), timeout=0.1)
-                    except asyncio.TimeoutError:
-                        # No more prefixes in the queue
-                        if queue.empty():
-                            break
-                        continue
-                    
-                    try:
-                        # Process the prefix with the semaphore
-                        async with sem:
-                            # Process each page of results
-                            session = get_session()
-                            async with session.create_client('s3') as client:
-                                paginator = client.get_paginator('list_objects_v2')
-                                # Process each page and send to results queue immediately
-                                async for page in paginator.paginate(Bucket=bucket, Prefix=current_prefix):
-                                    page_keys = []
-                                    if 'Contents' in page:
-                                        for obj in page['Contents']:
-                                            if not obj['Key'].endswith('/'):
-                                                page_keys.append(obj['Key'])
-                                        if page_keys:
-                                            # Put the keys in the results queue for yielding
-                                            await results_queue.put(page_keys)
-                    except Exception as e:
-                        logger.warning(f"Error processing prefix {current_prefix}: {e}")
-                    finally:
-                        queue.task_done()
-            
-            # Start workers
-            workers = []
-            for _ in range(concurrency):
-                task = asyncio.create_task(worker())
-                workers.append(task)
-            
-            # We don't actually need a consumer since the main loop is consuming
-            
-            # While work is being done, yield results directly from the results queue
-            done_checking = False
-            while not done_checking:
+            # Super simple approach: just create a task for each prefix
+            async def list_prefix(prefix_to_list):
+                """List all objects for a specific prefix."""
                 try:
-                    # Get results with a timeout
-                    result = await asyncio.wait_for(results_queue.get(), timeout=0.1)
-                    # Forward to main loop
-                    yield result
-                    results_queue.task_done()
-                except asyncio.TimeoutError:
-                    # Check if all work is done
-                    if queue.empty() and queue.qsize() == 0 and all(w.done() for w in workers):
-                        done_checking = True
+                    session = get_session()
+                    async with session.create_client('s3') as client:
+                        paginator = client.get_paginator('list_objects_v2')
+                        all_keys = []
+                        async for page in paginator.paginate(Bucket=bucket, Prefix=prefix_to_list):
+                            if 'Contents' in page:
+                                keys = [obj['Key'] for obj in page['Contents'] if not obj['Key'].endswith('/')]
+                                if keys:
+                                    all_keys.extend(keys)
+                        return all_keys
+                except Exception as e:
+                    logger.warning(f"Error listing prefix {prefix_to_list}: {e}")
+                    return []
             
-            # Cancel any remaining workers
-            for worker_task in workers:
-                worker_task.cancel()
+            # Create tasks for all prefixes (except root which we already processed)
+            tasks = [list_prefix(p) for p in all_prefixes[1:]]
             
-            # Wait for tasks to be cancelled
-            await asyncio.gather(*workers, return_exceptions=True)
+            # Process 20 prefixes at a time to avoid hitting S3 rate limits
+            # but still keep things simple
+            chunk_size = 20
+            for i in range(0, len(tasks), chunk_size):
+                chunk = tasks[i:i+chunk_size]
+                results = await asyncio.gather(*chunk)
+                
+                # Yield each non-empty result
+                for result in results:
+                    if result:
+                        yield result
     
     
     
