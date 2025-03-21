@@ -99,81 +99,6 @@ class FileUtils:
                 
                 if page_keys:
                     yield page_keys
-                    
-    @staticmethod
-    async def list_s3_objects_simple_parallel(bucket, prefix, delimiter='/'):
-        """Ultra-simple parallel listing of S3 objects.
-        
-        Gets all prefixes and lists them all at once.
-        
-        Args:
-            bucket: The S3 bucket name
-            prefix: The prefix to filter objects by
-            delimiter: The delimiter to use (default: '/')
-            
-        Yields:
-            Lists of S3 object keys as soon as they're found
-        """
-        # First, yield objects in the root prefix
-        session = get_session()
-        async with session.create_client('s3') as client:
-            paginator = client.get_paginator('list_objects_v2')
-            
-            # Find all prefixes first
-            all_prefixes = [prefix]  # Start with the root
-            
-            # List objects at the root prefix and collect sub-prefixes
-            async for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter=delimiter):
-                # Yield objects in the root prefix
-                if 'Contents' in page:
-                    keys = [obj['Key'] for obj in page['Contents'] if not obj['Key'].endswith('/')]
-                    if keys:
-                        yield keys
-                        
-                # Collect prefixes for parallel processing
-                if 'CommonPrefixes' in page:
-                    for common_prefix in page['CommonPrefixes']:
-                        all_prefixes.append(common_prefix['Prefix'])
-            
-            # Don't need to process further if we only have the root prefix
-            if len(all_prefixes) <= 1:
-                return
-                
-            logger.info(f"Found {len(all_prefixes)} prefixes to process")
-            
-            # Super simple approach: just create a task for each prefix
-            async def list_prefix(prefix_to_list):
-                """List all objects for a specific prefix."""
-                try:
-                    session = get_session()
-                    async with session.create_client('s3') as client:
-                        paginator = client.get_paginator('list_objects_v2')
-                        all_keys = []
-                        async for page in paginator.paginate(Bucket=bucket, Prefix=prefix_to_list):
-                            if 'Contents' in page:
-                                keys = [obj['Key'] for obj in page['Contents'] if not obj['Key'].endswith('/')]
-                                if keys:
-                                    all_keys.extend(keys)
-                        return all_keys
-                except Exception as e:
-                    logger.warning(f"Error listing prefix {prefix_to_list}: {e}")
-                    return []
-            
-            # Create tasks for all prefixes (except root which we already processed)
-            tasks = [list_prefix(p) for p in all_prefixes[1:]]
-            
-            # Process 20 prefixes at a time to avoid hitting S3 rate limits
-            # but still keep things simple
-            chunk_size = 8
-            for i in range(0, len(tasks), chunk_size):
-                chunk = tasks[i:i+chunk_size]
-                results = await asyncio.gather(*chunk)
-                
-                # Yield each non-empty result
-                for result in results:
-                    if result:
-                        yield result
-    
     
     
     @staticmethod
@@ -218,8 +143,9 @@ class FileUtils:
             # Parse the S3 path to get bucket and prefix
             bucket, prefix = FileUtils.parse_s3_path(path)
             
-            # Use simplified parallel listing for better progress bar responsiveness
-            async for page_keys in FileUtils.list_s3_objects_simple_parallel(bucket, prefix):
+            # Use aiobotocore to list objects directly in a paginated manner
+            # This allows for responsive UI updates during listing
+            async for page_keys in FileUtils.list_s3_objects_paginated(bucket, prefix):
                 # Create S3Path objects for each key in the current page
                 for key in page_keys:
                     yield UPath(f"s3://{bucket}/{key}")
