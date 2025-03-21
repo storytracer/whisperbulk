@@ -10,6 +10,7 @@ import json
 import aiofiles
 import srt
 import datetime
+import re
 from typing import List, Optional, Union, Any, Dict, Literal, Set, Tuple
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
@@ -20,6 +21,7 @@ from openai import AsyncOpenAI
 import tenacity
 from tqdm import tqdm
 from upath import UPath
+from aiobotocore.session import get_session
 
 # Constants
 AUDIO_EXTENSIONS = ("mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm")
@@ -71,10 +73,37 @@ class FileUtils:
         return False
     
     @staticmethod
-    def riterdir(path: UPath):
+    async def list_s3_objects(bucket, prefix):
+        """List all objects in an S3 bucket with the given prefix using aiobotocore.
+        
+        Args:
+            bucket: The S3 bucket name
+            prefix: The prefix to filter objects by
+            
+        Returns:
+            List of S3 object keys
+        """
+        session = get_session()
+        async with session.create_client('s3') as client:
+            paginator = client.get_paginator('list_objects_v2')
+            object_keys = []
+            
+            async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                if 'Contents' in page:
+                    for obj in page['Contents']:
+                        # Skip directories (objects ending with '/')
+                        if not obj['Key'].endswith('/'):
+                            object_keys.append(obj['Key'])
+            
+            return object_keys
+    
+    
+    @staticmethod
+    async def riterdir(path: UPath):
         """Recursively iterate through all files in a directory.
         
         This is a replacement for the non-existent riterdir method in UPath.
+        Uses optimized path for S3 with direct aiobotocore calls.
         
         Args:
             path: The UPath directory to recursively iterate through
@@ -82,10 +111,27 @@ class FileUtils:
         Yields:
             UPath objects for all files found recursively
         """
-        # Start with the contents of the directory
-        fs = path.fs
-        for file_path in fs.find(str(path), maxdepth=None, withdirs=False):
-            yield UPath(file_path)
+        # Special optimized path for S3
+        if path.protocol == 's3':
+            logger.info(f"Using optimized S3 listing for {path}")
+            # Get bucket and prefix directly from the UPath object
+            bucket = path.bucket
+            # The prefix should be the key part of the path (everything after the bucket)
+            prefix = path.key
+            
+            # Use aiobotocore to list objects directly
+            object_keys = await FileUtils.list_s3_objects(bucket, prefix)
+            
+            # Create S3Path objects using the base path and joining with the keys
+            base_path = UPath(f"s3://{bucket}")
+            for key in object_keys:
+                # This correctly uses UPath's joining logic to create a proper S3Path
+                yield base_path / key
+        else:
+            # For non-S3 paths, use the standard fsspec implementation
+            fs = path.fs
+            for file_path in fs.find(str(path), maxdepth=None, withdirs=False):
+                yield UPath(file_path)
 
 
 class FileManager:
@@ -109,23 +155,48 @@ class FileManager:
         self.input_files: List[UPath] = []
         self.output_files: Dict[str, Set[UPath]] = {}  # Format -> set of files
         
+        # Initialization will be done in the async init method
+        # We can't scan in __init__ because it needs to be async
+        
+    async def initialize(self):
+        """Asynchronously initialize the file manager by scanning directories."""
         # Initialize by scanning both directories
-        self._scan_input_files()
-        self._scan_output_files()
+        await self._scan_input_files()
+        await self._scan_output_files()
     
     
-    def _scan_input_files(self):
+    async def _scan_input_files(self):
         """Scan and cache all audio files in the input path."""
         logger.info(f"Scanning input path for audio files: {self.input_path}")
         
-        # Collect all files in a single step using our recursive directory iterator
-        all_files = list(tqdm(
-            FileUtils.riterdir(self.input_path),
+        # Use a list to collect files from the async iterator
+        all_files = []
+        file_iter = FileUtils.riterdir(self.input_path)
+        
+        # Create a progress bar that updates as we discover files
+        progress = tqdm(
             desc="Discovering files",
             unit="files",
             ncols=PROGRESS_BAR_WIDTH,
             leave=True
-        ))
+        )
+        
+        # Process files from the async iterator
+        if self.input_path.protocol == 's3':
+            # For S3, we need to handle async iteration
+            async for file in file_iter:
+                all_files.append(file)
+                progress.update(1)
+        else:
+            # For non-S3, we have a synchronous iterator
+            for file in file_iter:
+                all_files.append(file)
+                progress.update(1)
+        
+        # Close progress bar
+        progress.total = len(all_files)
+        progress.refresh()
+        progress.close()
         
         # Filter for audio files
         self.input_files = [file for file in all_files if FileUtils.is_audio_file(file)]
@@ -141,7 +212,7 @@ class FileManager:
         
         logger.info(f"Found {len(self.input_files)} audio files to process")
     
-    def _scan_output_files(self):
+    async def _scan_output_files(self):
         """Scan and cache all output files by format."""
         # Initialize output files dictionary with empty sets for each format
         self.output_files = {"json": set()}
@@ -156,14 +227,34 @@ class FileManager:
             return
             
         try:
-            # Collect all files in a single step using our recursive directory iterator
-            all_files = list(tqdm(
-                FileUtils.riterdir(self.output_path),
+            # Use a list to collect files from the async iterator
+            all_files = []
+            file_iter = FileUtils.riterdir(self.output_path)
+            
+            # Create a progress bar that updates as we discover files
+            progress = tqdm(
                 desc="Scanning existing output files",
                 unit="files",
                 ncols=PROGRESS_BAR_WIDTH,
                 leave=True
-            ))
+            )
+            
+            # Process files from the async iterator
+            if self.output_path.protocol == 's3':
+                # For S3, we need to handle async iteration
+                async for file in file_iter:
+                    all_files.append(file)
+                    progress.update(1)
+            else:
+                # For non-S3, we have a synchronous iterator
+                for file in file_iter:
+                    all_files.append(file)
+                    progress.update(1)
+            
+            # Close progress bar
+            progress.total = len(all_files)
+            progress.refresh()
+            progress.close()
             
             # Process and categorize files after collecting them all
             for path in all_files:
@@ -721,6 +812,9 @@ def main(input_path, output_path, concurrency, verbose, log_file, model, derivat
     async def run_pipeline():
         # Initialize the FileManager to bulk list all input and output files
         file_manager = FileManager(input_path_obj, output_path_obj)
+        
+        # Asynchronously initialize the file manager
+        await file_manager.initialize()
         
         # Check if we found any audio files
         if not file_manager.get_audio_files():

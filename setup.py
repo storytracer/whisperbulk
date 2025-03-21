@@ -18,6 +18,7 @@ setup(
         "srt",  # For SRT subtitle file generation
         "universal-pathlib",  # For unified path handling (local and cloud)
         "fsspec[s3]",  # Filesystem interface that supports multiple backends
+        "aiobotocore",  # For async S3 operations
     ],
     entry_points={
         "console_scripts": [
