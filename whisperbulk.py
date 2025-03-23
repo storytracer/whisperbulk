@@ -295,9 +295,16 @@ class FileManager:
         Returns:
             The full output path for the given format
         """
+        # Get the file stem (filename without extension)
         file_stem = file_path.stem
         
-        output_path = self.output_path / f"{file_stem}.{fmt}"
+        # Get relative path from input directory to the file
+        rel_path = file_path.relative_to(self.input_path)
+        # Remove the filename part, keeping only the directory structure
+        rel_dir = rel_path.parent
+            
+        # Construct the output path preserving the directory structure
+        output_path = self.output_path / rel_dir / f"{file_stem}.{fmt}"
         
         # Ensure the directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
