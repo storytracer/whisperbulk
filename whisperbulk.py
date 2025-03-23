@@ -21,7 +21,9 @@ from openai import AsyncOpenAI
 import tenacity
 from tqdm import tqdm
 from upath import UPath
+import fsspec
 from aiobotocore.session import get_session
+import os
 
 # Constants
 AUDIO_EXTENSIONS = ("mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm")
@@ -89,7 +91,7 @@ class FileUtils:
             paginator = client.get_paginator('list_objects_v2')
             
             # Process each page separately to allow for progress updates
-            async for page in paginator.paginate(Bucket=bucket, prefix=prefix):
+            async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
                 page_keys = []
                 if 'Contents' in page:
                     for obj in page['Contents']:
@@ -113,25 +115,8 @@ class FileUtils:
         Yields:
             UPath objects for all files found recursively
         """
-        # Special optimized path for S3
-        if path.protocol == 's3':
-            logger.info(f"Using optimized simple parallel S3 listing for {path}")
-            # Parse the S3 path to get bucket and prefix
-            bucket = path.parts[1]
-            prefix = '/'.join(path.parts[2:])
-            
-            # Use aiobotocore to list objects directly in a paginated manner
-            # This allows for responsive UI updates during listing
-            async for page_keys in FileUtils.list_s3_objects_paginated(bucket, prefix):
-                # Create S3Path objects for each key in the current page
-                for key in page_keys:
-                    object_path = path / key
-                    yield object_path
-        else:
-            # For non-S3 paths, use the standard fsspec implementation
-            fs = path.fs
-            for file_path in fs.find(str(path), maxdepth=None, withdirs=False):
-                yield UPath(file_path)
+        for file in path.glob('**/*'):
+            yield file
 
 
 class FileManager:
@@ -352,6 +337,7 @@ class FileManager:
             total=len(self.input_files),
             desc="Checking files to process",
             position=0,
+            ncols=PROGRESS_BAR_WIDTH,
             leave=True
         )
         
@@ -365,7 +351,6 @@ class FileManager:
                 files_to_process.append((file_path, needs_transcription, missing_derivatives))
             
             check_progress.update(1)
-            check_progress.refresh()  # Manually refresh the progress bar
         
         # Ensure the progress bar shows the correct total number of files checked
         check_progress.total = len(self.input_files)
@@ -388,7 +373,7 @@ class TranscriptionService:
     @tenacity.retry(
         retry=tenacity.retry_if_exception_type(Exception),
         wait=tenacity.wait_exponential(multiplier=1, min=4, max=60),
-        stop=tenacity.stop_after_attempt(5),
+        stop=tenacity.stop_after_attempt(3),
         before_sleep=lambda retry_state: logger.warning(
             f"Retrying {retry_state.attempt_number}/5 after exception: "
             f"{retry_state.outcome.exception() if retry_state.outcome else 'Unknown error'}"
@@ -399,7 +384,7 @@ class TranscriptionService:
         logger.info(f"Transcribing {file_path} with model {model}")
         
         result = None
-        with open(file_path, "rb") as audio_file:
+        with fsspec.open(file_path, "rb") as audio_file:
             # Use the temp file directly for transcription
             response = await self.client.audio.transcriptions.create(
                 file=audio_file, 
@@ -467,14 +452,8 @@ class FileOutputService:
         # Ensure directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Write the file using the appropriate method based on protocol
-        if output_path.protocol == "file":
-            # Use aiofiles for local files to get async IO benefits
-            async with aiofiles.open(str(output_path), 'w', encoding='utf-8') as f:
-                await f.write(content)
-        else:
-            # For cloud paths, use UPath's built-in methods
-            output_path.write_text(content)
+        with fsspec.open(output_path, "w") as f:
+            f.write(content)
         
         logger.info(f"Saved JSON transcription to {output_path}")
     
