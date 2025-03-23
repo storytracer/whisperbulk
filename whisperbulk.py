@@ -8,22 +8,24 @@ import asyncio
 import logging
 import json
 import aiofiles
+import aiofiles.tempfile
 import srt
 import datetime
 import re
+import os
+import contextlib
 from typing import List, Optional, Union, Any, Dict, Literal, Set, Tuple
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
+from pathlib import Path
+from urllib.parse import urlparse
 
 import click
 import dotenv
 from openai import AsyncOpenAI
 import tenacity
 from tqdm import tqdm
-from upath import UPath
-import fsspec
 from aiobotocore.session import get_session
-import os
 
 # Constants
 AUDIO_EXTENSIONS = ("mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm")
@@ -35,7 +37,7 @@ DEFAULT_MODEL = "Systran/faster-whisper-medium"
 dotenv.load_dotenv()
 
 # Setup logging
-log_dir = UPath(__file__).parent / "logs"
+log_dir = Path(__file__).parent / "logs"
 log_dir.mkdir(exist_ok=True)
 log_file = log_dir / "whisperbulk.log"
 
@@ -50,23 +52,207 @@ logger = logging.getLogger("whisperbulk")
 # Initialize OpenAI client with API key from environment
 openai_client = AsyncOpenAI()
 
+# Create a single aiobotocore session for the whole application
+boto_session = get_session()
+
+
+class FilePathType:
+    """Represents a path that can be either local or S3."""
+    
+    def __init__(self, path_str: str):
+        """Initialize from a string path that can be either local or s3://."""
+        self.original_path = path_str
+        parsed = urlparse(path_str)
+        self.scheme = parsed.scheme
+
+        if self.scheme == 's3':
+            self.bucket = parsed.netloc
+            # Remove leading slash for S3 keys
+            self.path = parsed.path.lstrip('/')
+            self.is_s3 = True
+            self.local_path = None
+        else:
+            self.bucket = None
+            self.path = path_str
+            self.is_s3 = False
+            self.local_path = Path(path_str)
+    
+    def __str__(self) -> str:
+        """Return the string representation of the path."""
+        return self.original_path
+    
+    def __truediv__(self, other) -> 'FilePathType':
+        """Support path / component operations like Path objects."""
+        if self.is_s3:
+            if self.path and not self.path.endswith('/'):
+                new_path = f"s3://{self.bucket}/{self.path}/{other}"
+            else:
+                new_path = f"s3://{self.bucket}/{self.path}{other}"
+        else:
+            new_path = str(self.local_path / other)
+        
+        return FilePathType(new_path)
+    
+    @property
+    def parent(self) -> 'FilePathType':
+        """Get the parent directory."""
+        if self.is_s3:
+            # Split the path and remove the last component
+            components = self.path.rstrip('/').split('/')
+            if len(components) <= 1:
+                # Root of bucket
+                return FilePathType(f"s3://{self.bucket}/")
+            
+            parent_path = '/'.join(components[:-1])
+            return FilePathType(f"s3://{self.bucket}/{parent_path}/")
+        else:
+            return FilePathType(str(self.local_path.parent))
+    
+    @property
+    def name(self) -> str:
+        """Get the filename."""
+        if self.is_s3:
+            components = self.path.rstrip('/').split('/')
+            return components[-1] if components else ""
+        else:
+            return self.local_path.name
+    
+    @property
+    def stem(self) -> str:
+        """Get the filename without extension."""
+        name = self.name
+        if '.' in name:
+            return name.rsplit('.', 1)[0]
+        return name
+    
+    @property
+    def suffix(self) -> str:
+        """Get the file extension with leading period."""
+        if self.is_s3:
+            if '.' in self.name:
+                return '.' + self.name.rsplit('.', 1)[1]
+            return ''
+        else:
+            return self.local_path.suffix
+    
+    async def exists(self) -> bool:
+        """Check if the path exists."""
+        if self.is_s3:
+            try:
+                async with boto_session.create_client('s3') as client:
+                    if self.path.endswith('/'):
+                        # For directories in S3, check if there are objects with this prefix
+                        response = await client.list_objects_v2(
+                            Bucket=self.bucket,
+                            Prefix=self.path,
+                            MaxKeys=1
+                        )
+                        return 'Contents' in response
+                    else:
+                        # For files, check if the object exists
+                        try:
+                            await client.head_object(Bucket=self.bucket, Key=self.path)
+                            return True
+                        except:
+                            return False
+            except Exception as e:
+                logger.error(f"Error checking if S3 path exists: {e}")
+                return False
+        else:
+            return self.local_path.exists()
+    
+    async def is_dir(self) -> bool:
+        """Check if the path is a directory."""
+        if self.is_s3:
+            # S3 doesn't have directories per se, but we can check if path ends with /
+            # or if there are objects with this prefix
+            if self.path.endswith('/'):
+                return True
+                
+            try:
+                async with boto_session.create_client('s3') as client:
+                    # Check if there are objects with this prefix + /
+                    dir_check = f"{self.path}/"
+                    response = await client.list_objects_v2(
+                        Bucket=self.bucket,
+                        Prefix=dir_check,
+                        MaxKeys=1
+                    )
+                    return 'Contents' in response
+            except Exception as e:
+                logger.error(f"Error checking if S3 path is directory: {e}")
+                return False
+        else:
+            return self.local_path.is_dir()
+    
+    async def mkdir(self, parents=False, exist_ok=False) -> None:
+        """Create a directory. For S3, this is a no-op as S3 doesn't have directories."""
+        if not self.is_s3:
+            self.local_path.mkdir(parents=parents, exist_ok=exist_ok)
+    
+    async def read_bytes(self) -> bytes:
+        """Read file contents as bytes."""
+        if self.is_s3:
+            async with boto_session.create_client('s3') as client:
+                response = await client.get_object(Bucket=self.bucket, Key=self.path)
+                async with response['Body'] as stream:
+                    return await stream.read()
+        else:
+            async with aiofiles.open(str(self.local_path), 'rb') as f:
+                return await f.read()
+    
+    async def read_text(self, encoding='utf-8') -> str:
+        """Read file contents as text."""
+        content = await self.read_bytes()
+        return content.decode(encoding)
+    
+    async def write_bytes(self, data: bytes) -> None:
+        """Write bytes to file."""
+        if self.is_s3:
+            async with boto_session.create_client('s3') as client:
+                await client.put_object(Bucket=self.bucket, Key=self.path, Body=data)
+        else:
+            async with aiofiles.open(str(self.local_path), 'wb') as f:
+                await f.write(data)
+    
+    async def write_text(self, data: str, encoding='utf-8') -> None:
+        """Write text to file."""
+        await self.write_bytes(data.encode(encoding))
+    
+    def relative_to(self, other: 'FilePathType') -> 'FilePathType':
+        """Get path relative to another path."""
+        if self.is_s3 and other.is_s3:
+            if self.bucket != other.bucket:
+                raise ValueError("Cannot get relative path between different S3 buckets")
+            
+            if not self.path.startswith(other.path):
+                raise ValueError(f"Path {self.path} does not start with {other.path}")
+            
+            rel_path = self.path[len(other.path):].lstrip('/')
+            return FilePathType(rel_path)
+        elif not self.is_s3 and not other.is_s3:
+            rel_path = self.local_path.relative_to(other.local_path)
+            return FilePathType(str(rel_path))
+        else:
+            raise ValueError("Cannot get relative path between local and S3 paths")
+
 
 class FileUtils:
     """Static utility methods for file operations."""
     
     @staticmethod
-    def get_extension(path: UPath) -> str:
+    def get_extension(path: FilePathType) -> str:
         """Get the file extension without the leading period."""
         return path.suffix.lower().lstrip('.')
     
     @staticmethod
-    def is_audio_file(path: UPath) -> bool:
+    def is_audio_file(path: FilePathType) -> bool:
         """Check if a file is a supported audio format."""
         suffix = FileUtils.get_extension(path)
         return suffix in AUDIO_EXTENSIONS
     
     @staticmethod
-    def is_output_file(path: UPath, output_files: Dict[str, Set[UPath]]) -> bool:
+    def is_output_file(path: FilePathType, output_files: Dict[str, Set[FilePathType]]) -> bool:
         """Check if a file is a supported output format and add it to the output files dictionary."""
         suffix = FileUtils.get_extension(path)
         if suffix == "json" or suffix in DERIVATIVE_FORMATS:
@@ -86,8 +272,7 @@ class FileUtils:
         Yields:
             Lists of S3 object keys, one list per page of results
         """
-        session = get_session()
-        async with session.create_client('s3') as client:
+        async with boto_session.create_client('s3') as client:
             paginator = client.get_paginator('list_objects_v2')
             
             # Process each page separately to allow for progress updates
@@ -103,20 +288,103 @@ class FileUtils:
                     yield page_keys
 
     @staticmethod
-    async def riterdir(path: UPath):
+    async def riterdir(path: FilePathType):
         """Recursively iterate through all files in a directory.
         
-        This is a replacement for the non-existent riterdir method in UPath.
         Uses optimized path for S3 with simple parallel async aiobotocore calls.
         
         Args:
-            path: The UPath directory to recursively iterate through
+            path: The directory to recursively iterate through
             
         Yields:
-            UPath objects for all files found recursively
+            FilePathType objects for all files found recursively
         """
-        for file in path.glob('**/*'):
+        if path.is_s3:
+            # For S3, use aiobotocore to list objects
+            bucket = path.bucket
+            prefix = path.path
+            if not prefix.endswith('/'):
+                prefix += '/'
+                
+            async for page_keys in FileUtils.list_s3_objects_paginated(bucket, prefix):
+                for key in page_keys:
+                    yield FilePathType(f"s3://{bucket}/{key}")
+        else:
+            # For local paths, use os.walk but make it async-compatible
+            for root, _, files in os.walk(str(path.local_path)):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    yield FilePathType(file_path)
+                # Give control back to the event loop occasionally
+                await asyncio.sleep(0)
+
+
+@asynccontextmanager
+async def open_file(file_path: FilePathType, mode='rb'):
+    """Context manager for opening files, handling both local and S3 paths."""
+    if file_path.is_s3:
+        if 'r' in mode:  # Reading
+            # Create a temporary file using aiofiles.tempfile
+            async with aiofiles.tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                temp_path = temp_file.name
+            
+            try:
+                # Download the S3 file to the temporary file
+                async with boto_session.create_client('s3') as client:
+                    response = await client.get_object(Bucket=file_path.bucket, Key=file_path.path)
+                    async with response['Body'] as stream:
+                        content = await stream.read()
+                
+                # Write the content to the temporary file
+                async with aiofiles.open(temp_path, 'wb') as f:
+                    await f.write(content)
+                
+                # Open the temporary file in the requested mode
+                file = await aiofiles.open(temp_path, mode)
+                try:
+                    yield file
+                finally:
+                    await file.close()
+                    # Clean up the temporary file
+                    os.unlink(temp_path)
+            except Exception as e:
+                # Clean up in case of error
+                os.unlink(temp_path)
+                raise e
+        else:  # Writing
+            # Create a temporary file using aiofiles.tempfile
+            async with aiofiles.tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                temp_path = temp_file.name
+            
+            try:
+                # Open the temporary file for writing
+                file = await aiofiles.open(temp_path, mode)
+                try:
+                    yield file
+                finally:
+                    await file.close()
+                
+                # Read the file content
+                async with aiofiles.open(temp_path, 'rb') as f:
+                    file_content = await f.read()
+                
+                # Upload to S3
+                async with boto_session.create_client('s3') as client:
+                    await client.put_object(Bucket=file_path.bucket, Key=file_path.path, Body=file_content)
+                
+                # Clean up the temporary file
+                os.unlink(temp_path)
+            except Exception as e:
+                # Clean up in case of error
+                os.unlink(temp_path)
+                raise e
+    else:
+        # For local files, use aiofiles directly
+        file = await aiofiles.open(str(file_path.local_path), mode)
+        try:
             yield file
+        finally:
+            await file.close()
 
 
 class FileManager:
@@ -125,7 +393,7 @@ class FileManager:
     Bulk lists all files in input and output paths at initialization and keeps them in memory.
     """
     
-    def __init__(self, input_path: UPath, output_path: UPath):
+    def __init__(self, input_path: FilePathType, output_path: FilePathType):
         """
         Initialize the FileManager with input and output paths.
         
@@ -137,8 +405,8 @@ class FileManager:
         self.output_path = output_path
         
         # Cache for discovered files
-        self.input_files: List[UPath] = []
-        self.output_files: Dict[str, Set[UPath]] = {}  # Format -> set of files
+        self.input_files: List[FilePathType] = []
+        self.output_files: Dict[str, Set[FilePathType]] = {}  # Format -> set of files
         
         # Initialization will be done in the async init method
         # We can't scan in __init__ because it needs to be async
@@ -156,7 +424,6 @@ class FileManager:
         
         # Use a list to collect files from the async iterator
         all_files = []
-        file_iter = FileUtils.riterdir(self.input_path)
         
         # Create a progress bar that updates as we discover files
         progress = tqdm(
@@ -167,16 +434,9 @@ class FileManager:
         )
         
         # Process files from the async iterator
-        if self.input_path.protocol == 's3':
-            # For S3, we need to handle async iteration
-            async for file in file_iter:
-                all_files.append(file)
-                progress.update(1)
-        else:
-            # For non-S3, we have a synchronous iterator
-            for file in file_iter:
-                all_files.append(file)
-                progress.update(1)
+        async for file in FileUtils.riterdir(self.input_path):
+            all_files.append(file)
+            progress.update(1)
         
         # Close progress bar
         progress.total = len(all_files)
@@ -189,11 +449,13 @@ class FileManager:
         # Display summary
         print(f"Found {len(self.input_files)} audio files out of {len(all_files)} total files")
         
-        if not self.input_files and self.input_path.is_dir():
-            print("No audio files found.")
-            logger.warning(
-                f"{self.input_path} is a directory with no audio files."
-            )
+        if not self.input_files:
+            input_is_dir = await self.input_path.is_dir()
+            if input_is_dir:
+                print("No audio files found.")
+                logger.warning(
+                    f"{self.input_path} is a directory with no audio files."
+                )
         
         logger.info(f"Found {len(self.input_files)} audio files to process")
     
@@ -207,13 +469,13 @@ class FileManager:
         logger.info(f"Scanning existing output files in {self.output_path}")
         
         # Skip if output directory doesn't exist yet
-        if not self.output_path.exists():
+        output_exists = await self.output_path.exists()
+        if not output_exists:
             logger.info("Output directory does not exist yet, no existing files to scan")
             return
             
         # Use a list to collect files from the async iterator
         all_files = []
-        file_iter = FileUtils.riterdir(self.output_path)
         
         # Create a progress bar that updates as we discover files
         progress = tqdm(
@@ -224,16 +486,9 @@ class FileManager:
         )
         
         # Process files from the async iterator
-        if self.output_path.protocol == 's3':
-            # For S3, we need to handle async iteration
-            async for file in file_iter:
-                all_files.append(file)
-                progress.update(1)
-        else:
-            # For non-S3, we have a synchronous iterator
-            for file in file_iter:
-                all_files.append(file)
-                progress.update(1)
+        async for file in FileUtils.riterdir(self.output_path):
+            all_files.append(file)
+            progress.update(1)
         
         # Close progress bar
         progress.total = len(all_files)
@@ -252,11 +507,11 @@ class FileManager:
         
         logger.info(f"Found {total_files} existing output files in {self.output_path}")
     
-    def get_audio_files(self) -> List[UPath]:
+    def get_audio_files(self) -> List[FilePathType]:
         """Return all discovered audio files."""
         return self.input_files
     
-    def get_output_files_by_format(self, format_name: str) -> List[UPath]:
+    def get_output_files_by_format(self, format_name: str) -> List[FilePathType]:
         """Return all output files of a specific format."""
         return list(self.output_files.get(format_name, set()))
     
@@ -284,7 +539,7 @@ class FileManager:
                 
         return mapping
     
-    def get_output_path(self, file_path: UPath, fmt: str) -> UPath:
+    def get_output_path(self, file_path: FilePathType, fmt: str) -> FilePathType:
         """
         Generate the output path for a given file and format, preserving relative path structure.
         
@@ -307,11 +562,11 @@ class FileManager:
         output_path = self.output_path / rel_dir / f"{file_stem}.{fmt}"
         
         # Ensure the directory exists
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        asyncio.create_task(output_path.parent.mkdir(parents=True, exist_ok=True))
         
         return output_path
     
-    def check_transcription_needed(self, file_path: UPath, file_stem_mapping: Dict) -> bool:
+    def check_transcription_needed(self, file_path: FilePathType, file_stem_mapping: Dict) -> bool:
         """
         Check if a file needs transcription.
         
@@ -327,7 +582,7 @@ class FileManager:
     
     def get_missing_derivatives(
         self, 
-        file_path: UPath, 
+        file_path: FilePathType, 
         derivatives: List[str],
         file_stem_mapping: Dict
     ) -> Set[str]:
@@ -358,7 +613,7 @@ class FileManager:
         self, 
         derivatives: Optional[List[str]], 
         force: bool = False
-    ) -> List[Tuple[UPath, bool, Set[str]]]:
+    ) -> List[Tuple[FilePathType, bool, Set[str]]]:
         """
         Determine which files need processing and what formats are needed.
         
@@ -426,24 +681,57 @@ class TranscriptionService:
         wait=tenacity.wait_exponential(multiplier=1, min=4, max=60),
         stop=tenacity.stop_after_attempt(3),
         before_sleep=lambda retry_state: logger.warning(
-            f"Retrying {retry_state.attempt_number}/5 after exception: "
+            f"Retrying {retry_state.attempt_number}/3 after exception: "
             f"{retry_state.outcome.exception() if retry_state.outcome else 'Unknown error'}"
         ),
     )
-    async def transcribe_file(self, file_path: UPath, model: str) -> Dict:
+    async def transcribe_file(self, file_path: FilePathType, model: str) -> Dict:
         """Transcribe a single audio file using the specified Whisper model with retry logic."""
         logger.info(f"Transcribing {file_path} with model {model}")
         
         result = None
-        with fsspec.open(file_path, "rb") as audio_file:
-            # Use the temp file directly for transcription
-            response = await self.client.audio.transcriptions.create(
-                file=audio_file, 
-                model=model,
-                response_format="verbose_json"
-            )
+        
+        # Use aiofiles.tempfile for temporary file handling
+        async with aiofiles.tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_path = temp_file.name
+        
+        try:
+            # Get file content - either from S3 or local file
+            if file_path.is_s3:
+                # Download S3 file
+                async with boto_session.create_client('s3') as client:
+                    response = await client.get_object(Bucket=file_path.bucket, Key=file_path.path)
+                    async with response['Body'] as stream:
+                        content = await stream.read()
+                
+                # Write to temporary file
+                async with aiofiles.open(temp_path, 'wb') as f:
+                    await f.write(content)
+            else:
+                # Copy local file to temporary file
+                async with aiofiles.open(str(file_path.local_path), 'rb') as src:
+                    content = await src.read()
+                async with aiofiles.open(temp_path, 'wb') as dst:
+                    await dst.write(content)
             
-            result = response.model_dump() if hasattr(response, "model_dump") else response
+            # Use the temporary file for transcription
+            # OpenAI API still requires a file object, which is synchronous
+            with open(temp_path, 'rb') as audio_file:
+                response = await self.client.audio.transcriptions.create(
+                    file=audio_file, 
+                    model=model,
+                    response_format="verbose_json"
+                )
+                
+                result = response.model_dump() if hasattr(response, "model_dump") else response
+            
+            # Clean up temporary file
+            os.unlink(temp_path)
+        except Exception as e:
+            # Clean up temporary file in case of error
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            raise e
         
         return result
 
@@ -512,23 +800,23 @@ class FileOutputService:
         self.converter = converter or TranscriptionConverter()
     
     @staticmethod
-    async def save_json_transcription(transcription_data: Dict, output_path: UPath) -> None:
+    async def save_json_transcription(transcription_data: Dict, output_path: FilePathType) -> None:
         """Save transcription results as JSON."""
         # Format as JSON string
         content = json.dumps(transcription_data, indent=2, ensure_ascii=False)
         
         # Ensure directory exists
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        await output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        with fsspec.open(output_path, "w") as f:
-            f.write(content)
+        # Write the content
+        await output_path.write_text(content)
         
         logger.info(f"Saved JSON transcription to {output_path}")
     
     async def save_derivative(
         self,
         transcription_data: Dict,
-        output_path: UPath,
+        output_path: FilePathType,
         format_name: Literal["txt", "srt"]
     ) -> None:
         """Save transcription results in a derivative format (txt or srt)."""
@@ -536,16 +824,10 @@ class FileOutputService:
         content = self.converter.convert(transcription_data, format_name)
         
         # Ensure directory exists
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        await output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Write the file using the appropriate method based on protocol
-        if output_path.protocol == "file":
-            # Use aiofiles for local files to get async IO benefits
-            async with aiofiles.open(str(output_path), 'w', encoding='utf-8') as f:
-                await f.write(content)
-        else:
-            # For cloud paths, use UPath's built-in methods
-            output_path.write_text(content)
+        # Write the file
+        await output_path.write_text(content)
         
         logger.info(f"Saved {format_name.upper()} derivative to {output_path}")
 
@@ -570,7 +852,7 @@ class TranscriptionProcessor:
     
     async def process_file(
         self,
-        file_path: UPath,
+        file_path: FilePathType,
         model: str = DEFAULT_MODEL,
         derivatives: Optional[List[Literal["txt", "srt"]]] = None
     ) -> None:
@@ -592,7 +874,7 @@ class TranscriptionProcessor:
         json_path = self.file_manager.get_output_path(file_path, "json")
             
         # Check if JSON file exists
-        json_exists = json_path.exists()
+        json_exists = await json_path.exists()
         
         # Initialize results and tasks
         transcription_data = None
@@ -601,15 +883,8 @@ class TranscriptionProcessor:
         # STEP 1: Try to use existing JSON if possible
         if json_exists:
             logger.info(f"Found existing JSON file: {json_path}")
-            # Read the file using the appropriate method based on protocol
-            if json_path.protocol == "file":
-                # Use aiofiles for local files to get async IO benefits
-                async with aiofiles.open(str(json_path), 'rb') as f:
-                    json_content = await f.read()
-            else:
-                # For cloud paths, use UPath's built-in methods
-                json_content = json_path.read_bytes()
-            
+            # Read the JSON file
+            json_content = await json_path.read_bytes()
             json_text = json_content.decode('utf-8')
             transcription_data = json.loads(json_text)
         
@@ -787,21 +1062,15 @@ def main(input_path, output_path, concurrency, verbose, log_file, model, derivat
     
         whisperbulk ./audio_files ./transcriptions --force
     """
-    # Convert input and output paths to UPath objects
-    input_path_obj = UPath(input_path)
-    output_path_obj = UPath(output_path) if output_path else None
-    
-    # Validate that input path is a directory
-    if not input_path_obj.is_dir():
-        print(f"Error: Input path '{input_path}' must be a directory.")
-        logger.error(f"Input path '{input_path}' is not a directory")
-        sys.exit(1)
+    # Convert input and output paths to FilePathType objects
+    input_path_obj = FilePathType(input_path)
+    output_path_obj = FilePathType(output_path) if output_path else None
     
     # Configure logging
     if log_file:
         # If user provided custom log file path
-        log_path = UPath(log_file)
-        if log_path.parent != UPath('.'):
+        log_path = Path(log_file)
+        if log_path.parent != Path('.'):
             log_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Reconfigure the logging to use the custom file
@@ -818,12 +1087,19 @@ def main(input_path, output_path, concurrency, verbose, log_file, model, derivat
         # Just change the log level if using default log file
         logger.setLevel(logging.DEBUG)
 
-    # Ensure output directory exists if it's local
-    if output_path_obj and output_path_obj.protocol == "file":
-        output_path_obj.parent.mkdir(parents=True, exist_ok=True)
-
     # Use asyncio to run the entire pipeline
     async def run_pipeline():
+        # Validate that input path is a directory
+        input_is_dir = await input_path_obj.is_dir()
+        if not input_is_dir:
+            print(f"Error: Input path '{input_path}' must be a directory.")
+            logger.error(f"Input path '{input_path}' is not a directory")
+            sys.exit(1)
+            
+        # Ensure output directory exists if it's local
+        if output_path_obj and not output_path_obj.is_s3:
+            await output_path_obj.mkdir(parents=True, exist_ok=True)
+            
         # Initialize the FileManager to bulk list all input and output files
         file_manager = FileManager(input_path_obj, output_path_obj)
         
