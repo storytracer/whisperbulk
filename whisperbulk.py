@@ -73,7 +73,7 @@ class FileUtils:
         return False
     
     @staticmethod
-    async def list_s3_objects_paginated(bucket, prefix):
+    async def list_s3_objects_paginated(bucket, prefix=""):
         """List all objects in an S3 bucket with the given prefix using aiobotocore.
         Returns results page by page for responsive UI updates.
         
@@ -89,7 +89,7 @@ class FileUtils:
             paginator = client.get_paginator('list_objects_v2')
             
             # Process each page separately to allow for progress updates
-            async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            async for page in paginator.paginate(Bucket=bucket, prefix=prefix):
                 page_keys = []
                 if 'Contents' in page:
                     for obj in page['Contents']:
@@ -99,30 +99,6 @@ class FileUtils:
                 
                 if page_keys:
                     yield page_keys
-    
-    
-    @staticmethod
-    def parse_s3_path(s3_path):
-        """Parse an S3 path into bucket and key components.
-        
-        Args:
-            s3_path: An S3 path in the format s3://bucket/key
-            
-        Returns:
-            Tuple of (bucket, key)
-        """
-        # Remove s3:// prefix and split by first slash
-        path_str = str(s3_path)
-        if not path_str.startswith('s3://'):
-            raise ValueError(f"Not an S3 path: {path_str}")
-            
-        path = path_str.replace('s3://', '')
-        parts = path.split('/', 1)
-        
-        bucket = parts[0]
-        key = parts[1] if len(parts) > 1 else ''
-        
-        return bucket, key
 
     @staticmethod
     async def riterdir(path: UPath):
@@ -141,14 +117,16 @@ class FileUtils:
         if path.protocol == 's3':
             logger.info(f"Using optimized simple parallel S3 listing for {path}")
             # Parse the S3 path to get bucket and prefix
-            bucket, prefix = FileUtils.parse_s3_path(path)
+            bucket = path.parts[1]
+            prefix = '/'.join(path.parts[2:])
             
             # Use aiobotocore to list objects directly in a paginated manner
             # This allows for responsive UI updates during listing
             async for page_keys in FileUtils.list_s3_objects_paginated(bucket, prefix):
                 # Create S3Path objects for each key in the current page
                 for key in page_keys:
-                    yield UPath(f"s3://{bucket}/{key}")
+                    object_path = path / key
+                    yield object_path
         else:
             # For non-S3 paths, use the standard fsspec implementation
             fs = path.fs
@@ -248,43 +226,38 @@ class FileManager:
             logger.info("Output directory does not exist yet, no existing files to scan")
             return
             
-        try:
-            # Use a list to collect files from the async iterator
-            all_files = []
-            file_iter = FileUtils.riterdir(self.output_path)
-            
-            # Create a progress bar that updates as we discover files
-            progress = tqdm(
-                desc="Scanning existing output files",
-                unit="files",
-                ncols=PROGRESS_BAR_WIDTH,
-                leave=True
-            )
-            
-            # Process files from the async iterator
-            if self.output_path.protocol == 's3':
-                # For S3, we need to handle async iteration
-                async for file in file_iter:
-                    all_files.append(file)
-                    progress.update(1)
-            else:
-                # For non-S3, we have a synchronous iterator
-                for file in file_iter:
-                    all_files.append(file)
-                    progress.update(1)
-            
-            # Close progress bar
-            progress.total = len(all_files)
-            progress.refresh()
-            progress.close()
-            
-            # Process and categorize files after collecting them all
-            for path in all_files:
-                FileUtils.is_output_file(path, self.output_files)
-                
-        except Exception as e:
-            logger.warning(f"Error scanning output directory {self.output_path}: {e}")
-            all_files = []
+        # Use a list to collect files from the async iterator
+        all_files = []
+        file_iter = FileUtils.riterdir(self.output_path)
+        
+        # Create a progress bar that updates as we discover files
+        progress = tqdm(
+            desc="Scanning existing output files",
+            unit="files",
+            ncols=PROGRESS_BAR_WIDTH,
+            leave=True
+        )
+        
+        # Process files from the async iterator
+        if self.output_path.protocol == 's3':
+            # For S3, we need to handle async iteration
+            async for file in file_iter:
+                all_files.append(file)
+                progress.update(1)
+        else:
+            # For non-S3, we have a synchronous iterator
+            for file in file_iter:
+                all_files.append(file)
+                progress.update(1)
+        
+        # Close progress bar
+        progress.total = len(all_files)
+        progress.refresh()
+        progress.close()
+        
+        # Process and categorize files after collecting them all
+        for path in all_files:
+            FileUtils.is_output_file(path, self.output_files)
         
         # Count total files found
         total_files = sum(len(files) for files in self.output_files.values())
@@ -311,18 +284,7 @@ class FileManager:
         """
         file_stem = file_path.stem
         
-        # Handle relative paths differently based on protocol
-        if file_path.protocol == self.input_path.protocol:
-            # For same protocol, we can use relative_to
-            try:
-                rel_path = file_path.relative_to(self.input_path)
-                output_path = self.output_path / rel_path.parent / f"{file_stem}.{fmt}"
-            except ValueError:
-                # If relative_to fails, use a flattened structure
-                output_path = self.output_path / f"{file_stem}.{fmt}"
-        else:
-            # For different protocols, use a flattened structure
-            output_path = self.output_path / f"{file_stem}.{fmt}"
+        output_path = self.output_path / f"{file_stem}.{fmt}"
         
         # Ensure the directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -576,77 +538,67 @@ class TranscriptionProcessor:
             model: Whisper model to use for transcription
             derivatives: Derivative formats to generate (txt, srt)
         """
-        try:
-            logger.info(f"Processing file: {file_path}")
+        logger.info(f"Processing file: {file_path}")
+        
+        # Set empty list if derivatives is None
+        derivatives_to_process = derivatives or []
+        
+        # Get the JSON output path
+        json_path = self.file_manager.get_output_path(file_path, "json")
             
-            # Set empty list if derivatives is None
-            derivatives_to_process = derivatives or []
-            
-            # Get the JSON output path
-            json_path = self.file_manager.get_output_path(file_path, "json")
-                
-            # Check if JSON file exists
-            json_exists = json_path.exists()
-            
-            # Initialize results and tasks
-            transcription_data = None
-            save_tasks = []
-            
-            # STEP 1: Try to use existing JSON if possible
-            if json_exists:
-                logger.info(f"Found existing JSON file: {json_path}")
-                # Load and parse the JSON file
-                try:
-                    # Read the file using the appropriate method based on protocol
-                    if json_path.protocol == "file":
-                        # Use aiofiles for local files to get async IO benefits
-                        async with aiofiles.open(str(json_path), 'rb') as f:
-                            json_content = await f.read()
-                    else:
-                        # For cloud paths, use UPath's built-in methods
-                        json_content = json_path.read_bytes()
-                    
-                    json_text = json_content.decode('utf-8')
-                    transcription_data = json.loads(json_text)
-                except json.JSONDecodeError as e:
-                    logger.error(f"Error parsing existing JSON file {json_path}: {e}")
-                    transcription_data = None  # Force re-transcription
-            
-            # STEP 2: If no valid JSON exists, perform transcription
-            if not json_exists or transcription_data is None:
-                logger.info(f"Transcribing: {file_path}")
-                transcription_data = await self.transcription_service.transcribe_file(file_path, model)
-                
-                # Save JSON result
-                save_tasks.append(self.output_service.save_json_transcription(
-                    transcription_data, 
-                    json_path
-                ))
-            
-            # STEP 3: Create derivative formats if requested
-            for fmt in derivatives_to_process:
-                # Get the output path for this derivative format
-                output_path = self.file_manager.get_output_path(file_path, fmt)
-                
-                # Check if this derivative already exists
-                if not output_path.exists():
-                    logger.info(f"Creating {fmt} derivative: {output_path}")
-                    save_tasks.append(self.output_service.save_derivative(
-                        transcription_data,
-                        output_path,
-                        fmt
-                    ))
-            
-            # Run all save tasks concurrently for better performance
-            if save_tasks:
-                await asyncio.gather(*save_tasks)
-                logger.info(f"Completed processing {file_path}")
+        # Check if JSON file exists
+        json_exists = json_path.exists()
+        
+        # Initialize results and tasks
+        transcription_data = None
+        save_tasks = []
+        
+        # STEP 1: Try to use existing JSON if possible
+        if json_exists:
+            logger.info(f"Found existing JSON file: {json_path}")
+            # Read the file using the appropriate method based on protocol
+            if json_path.protocol == "file":
+                # Use aiofiles for local files to get async IO benefits
+                async with aiofiles.open(str(json_path), 'rb') as f:
+                    json_content = await f.read()
             else:
-                logger.info(f"No new outputs to generate for {file_path}")
-    
-        except Exception as e:
-            logger.error(f"Error processing {file_path}: {e}")
-            raise
+                # For cloud paths, use UPath's built-in methods
+                json_content = json_path.read_bytes()
+            
+            json_text = json_content.decode('utf-8')
+            transcription_data = json.loads(json_text)
+        
+        # STEP 2: If no valid JSON exists, perform transcription
+        if not json_exists or transcription_data is None:
+            logger.info(f"Transcribing: {file_path}")
+            transcription_data = await self.transcription_service.transcribe_file(file_path, model)
+            
+            # Save JSON result
+            save_tasks.append(self.output_service.save_json_transcription(
+                transcription_data, 
+                json_path
+            ))
+        
+        # STEP 3: Create derivative formats if requested
+        for fmt in derivatives_to_process:
+            # Get the output path for this derivative format
+            output_path = self.file_manager.get_output_path(file_path, fmt)
+            
+            # Check if this derivative already exists
+            if not output_path.exists():
+                logger.info(f"Creating {fmt} derivative: {output_path}")
+                save_tasks.append(self.output_service.save_derivative(
+                    transcription_data,
+                    output_path,
+                    fmt
+                ))
+        
+        # Run all save tasks concurrently for better performance
+        if save_tasks:
+            await asyncio.gather(*save_tasks)
+            logger.info(f"Completed processing {file_path}")
+        else:
+            logger.info(f"No new outputs to generate for {file_path}")
     
     async def process_files(
         self,
@@ -717,14 +669,10 @@ class TranscriptionProcessor:
         
         async def process_and_update(file_info):
             file_path, needs_transcription, missing_derivatives = file_info
-            try:
-                await _process_with_semaphore(file_path, needs_transcription, missing_derivatives)
-            except Exception as e:
-                logger.error(f"Failed to process {file_path}: {e}")
-            finally:
-                # Always update progress, even if file processing fails
-                progress.update(1)
-                progress.refresh()  # Manually refresh the progress bar
+            await _process_with_semaphore(file_path, needs_transcription, missing_derivatives)
+            # Always update progress, even if file processing fails
+            progress.update(1)
+            progress.refresh()  # Manually refresh the progress bar
         
         # Create tasks for all files and process them concurrently
         tasks = [process_and_update(info) for info in processing_info]
