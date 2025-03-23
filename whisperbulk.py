@@ -217,7 +217,7 @@ class FileManager:
         
         # Create a progress bar that updates as we discover files
         progress = tqdm(
-            desc="Scanning existing output files",
+            desc="Scanning output files",
             unit="files",
             ncols=PROGRESS_BAR_WIDTH,
             leave=True
@@ -256,6 +256,34 @@ class FileManager:
         """Return all discovered audio files."""
         return self.input_files
     
+    def get_output_files_by_format(self, format_name: str) -> List[UPath]:
+        """Return all output files of a specific format."""
+        return list(self.output_files.get(format_name, set()))
+    
+    def get_file_stem_mapping(self) -> Dict[str, Dict[str, Set[str]]]:
+        """
+        Create a mapping of file stems to formats and paths for efficient lookup.
+        
+        Returns:
+            A dictionary mapping file stems to a dictionary of formats and their paths
+        """
+        mapping = {}
+        
+        # Group output files by stem and format
+        for fmt, files in self.output_files.items():
+            for file in files:
+                stem = file.stem
+                
+                if stem not in mapping:
+                    mapping[stem] = {}
+                    
+                if fmt not in mapping[stem]:
+                    mapping[stem][fmt] = set()
+                    
+                mapping[stem][fmt].add(str(file))
+                
+        return mapping
+    
     def get_output_path(self, file_path: UPath, fmt: str) -> UPath:
         """
         Generate the output path for a given file and format, preserving relative path structure.
@@ -276,39 +304,48 @@ class FileManager:
         
         return output_path
     
-    def check_file_needs_processing(
-        self, 
-        file_path: UPath, 
-        derivatives: Optional[List[str]]
-    ) -> Tuple[bool, bool, Set[str]]:
+    def check_transcription_needed(self, file_path: UPath, file_stem_mapping: Dict) -> bool:
         """
-        Check if a file needs transcription and/or derivative creation.
+        Check if a file needs transcription.
         
         Args:
             file_path: Path to the audio file to check
-            derivatives: List of derivative formats to generate
+            file_stem_mapping: Mapping of file stems to formats and paths
             
         Returns:
-            Tuple of (needs_transcription, needs_derivatives, missing_derivatives) where:
-            - needs_transcription: True if JSON transcription needs to be generated
-            - needs_derivatives: True if any derivative format needs to be generated
-            - missing_derivatives: Set of derivative formats that need to be generated
+            True if transcription is needed, False otherwise
         """
-        # Get path to JSON transcription
-        json_path = self.get_output_path(file_path, "json")
-        needs_transcription = json_path not in self.output_files["json"]
+        stem = file_path.stem
+        return stem not in file_stem_mapping or "json" not in file_stem_mapping[stem]
+    
+    def get_missing_derivatives(
+        self, 
+        file_path: UPath, 
+        derivatives: List[str],
+        file_stem_mapping: Dict
+    ) -> Set[str]:
+        """
+        Get the set of derivative formats that need to be generated for a file.
         
+        Args:
+            file_path: Path to the audio file to check
+            derivatives: List of derivative formats to check
+            file_stem_mapping: Mapping of file stems to formats and paths
+            
+        Returns:
+            Set of derivative formats that need to be generated
+        """
+        if not derivatives:
+            return set()
+            
+        stem = file_path.stem
+        
+        # If the file stem isn't in the mapping or has no derivatives, all are missing
+        if stem not in file_stem_mapping:
+            return set(derivatives)
+            
         # Check which derivatives are missing
-        missing_derivatives = set()
-        if derivatives:
-            for fmt in derivatives:
-                output_path = self.get_output_path(file_path, fmt)
-                if output_path not in self.output_files[fmt]:
-                    missing_derivatives.add(fmt)
-        
-        needs_derivatives = len(missing_derivatives) > 0
-        
-        return needs_transcription, needs_derivatives, missing_derivatives
+        return set(fmt for fmt in derivatives if fmt not in file_stem_mapping[stem])
     
     def get_files_needing_processing(
         self, 
@@ -329,6 +366,9 @@ class FileManager:
             # In force mode, process everything
             return [(file, True, set(derivatives or [])) for file in self.input_files]
         
+        # Create file stem mapping for efficient lookup
+        file_stem_mapping = self.get_file_stem_mapping()
+        
         # Check each file to see what processing it needs
         files_to_process = []
         
@@ -342,12 +382,16 @@ class FileManager:
         )
         
         for file_path in self.input_files:
-            # Check if file needs processing and which formats are missing
-            needs_transcription, needs_derivatives, missing_derivatives = self.check_file_needs_processing(
-                file_path, derivatives
+            # Check if file needs transcription
+            needs_transcription = self.check_transcription_needed(file_path, file_stem_mapping)
+            
+            # Check which derivatives are missing
+            missing_derivatives = self.get_missing_derivatives(
+                file_path, derivatives or [], file_stem_mapping
             )
             
-            if needs_transcription or needs_derivatives:
+            # If either transcription or derivatives are needed, add to list
+            if needs_transcription or missing_derivatives:
                 files_to_process.append((file_path, needs_transcription, missing_derivatives))
             
             check_progress.update(1)
@@ -397,10 +441,23 @@ class TranscriptionService:
         return result
 
 
-class DerivativeConverter:
+class TranscriptionConverter:
     """
-    Handles conversion from JSON transcription data to derivative formats.
+    Handles conversion of JSON transcription data to various derivative formats.
     """
+    
+    @staticmethod
+    def convert(
+        transcription_data: Dict,
+        format_name: Literal["txt", "srt"]
+    ) -> str:
+        """Convert JSON transcription data to the specified format."""
+        if format_name == "txt":
+            return TranscriptionConverter.to_text(transcription_data)
+        elif format_name == "srt":
+            return TranscriptionConverter.to_srt(transcription_data)
+        else:
+            raise ValueError(f"Unsupported derivative format: {format_name}")
     
     @staticmethod
     def to_text(transcription_data: Dict) -> str:
@@ -443,6 +500,10 @@ class DerivativeConverter:
 class FileOutputService:
     """Handles saving transcription data to files in various formats."""
     
+    def __init__(self, converter: TranscriptionConverter = None):
+        """Initialize with an optional converter."""
+        self.converter = converter or TranscriptionConverter()
+    
     @staticmethod
     async def save_json_transcription(transcription_data: Dict, output_path: UPath) -> None:
         """Save transcription results as JSON."""
@@ -457,20 +518,15 @@ class FileOutputService:
         
         logger.info(f"Saved JSON transcription to {output_path}")
     
-    @staticmethod
     async def save_derivative(
+        self,
         transcription_data: Dict,
         output_path: UPath,
         format_name: Literal["txt", "srt"]
     ) -> None:
         """Save transcription results in a derivative format (txt or srt)."""
-        # Convert to the requested format
-        if format_name == "txt":
-            content = DerivativeConverter.to_text(transcription_data)
-        elif format_name == "srt":
-            content = DerivativeConverter.to_srt(transcription_data)
-        else:
-            raise ValueError(f"Unsupported derivative format: {format_name}")
+        # Convert to the requested format using the converter
+        content = self.converter.convert(transcription_data, format_name)
         
         # Ensure directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -496,12 +552,14 @@ class TranscriptionProcessor:
         self, 
         file_manager: FileManager,
         transcription_service: TranscriptionService = None,
-        output_service: FileOutputService = None
+        output_service: FileOutputService = None,
+        converter: TranscriptionConverter = None
     ):
         """Initialize the processor with needed services."""
         self.file_manager = file_manager
         self.transcription_service = transcription_service or TranscriptionService()
-        self.output_service = output_service or FileOutputService()
+        self.converter = converter or TranscriptionConverter()
+        self.output_service = output_service or FileOutputService(self.converter)
     
     async def process_file(
         self,
@@ -510,7 +568,8 @@ class TranscriptionProcessor:
         derivatives: Optional[List[Literal["txt", "srt"]]] = None
     ) -> None:
         """
-        Process a single file: transcribe to JSON and optionally create derivative formats.
+        Process a single file: transcribe to JSON and generate derivative formats.
+        Always generates derivatives, overwriting existing ones if they exist.
         
         Args:
             file_path: Path to the audio file to process
@@ -558,19 +617,18 @@ class TranscriptionProcessor:
                 json_path
             ))
         
-        # STEP 3: Create derivative formats if requested
+        # STEP 3: Create derivative formats if requested - ALWAYS generate them
         for fmt in derivatives_to_process:
             # Get the output path for this derivative format
             output_path = self.file_manager.get_output_path(file_path, fmt)
             
-            # Check if this derivative already exists
-            if not output_path.exists():
-                logger.info(f"Creating {fmt} derivative: {output_path}")
-                save_tasks.append(self.output_service.save_derivative(
-                    transcription_data,
-                    output_path,
-                    fmt
-                ))
+            # Always generate derivatives, overwriting existing ones
+            logger.info(f"Creating {fmt} derivative: {output_path}")
+            save_tasks.append(self.output_service.save_derivative(
+                transcription_data,
+                output_path,
+                fmt
+            ))
         
         # Run all save tasks concurrently for better performance
         if save_tasks:
